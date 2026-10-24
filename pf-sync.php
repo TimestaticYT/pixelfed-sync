@@ -838,10 +838,12 @@ function pixelfed_comments(string $host, string $accountId, string $statusId, in
 
 /**
  * Comments a Pixelfed server lists under its own (unfetchable) URL although
- * they come from another server. For a Mastodon-API author the original is
- * found on their server by its timestamp and fetched; otherwise (Pixelfed
- * hides replies from its public listing) the comment is stored from the data
- * given, the way Pixelfed stores remote text comments. Returns [fetched, stored].
+ * they come from another server. The original is looked up where it lives:
+ * the commenter's server lists the same thread with its own users' comments
+ * under their real URLs; a Mastodon-API server also lists the author's replies.
+ * Only if both fail is the comment stored from the data given (replies to such
+ * a copy can't be threaded remotely). Earlier copies are replaced once the
+ * original is found. Returns [fetched, stored].
  */
 function add_comment_copies(array $comments, Status $post): array
 {
@@ -850,22 +852,39 @@ function add_comment_copies(array $comments, Status $post): array
 
     $fetched = $stored = 0;
     foreach ($comments as $r) {
-        if (stored_status($r['uri'])) {
+        $copy = stored_status($r['uri']);
+        if ($copy && Cache::has(KEY.'copy-checked:'.$copy->id)) {
             continue;
         }
         $author = is_string($r['account']['url'] ?? null) ? Helpers::profileFetch($r['account']['url']) : null;
         if (! $author || ! $author->domain) {
             continue;
         }
-        if (($original = find_original_comment($r, $author)) && ! stored_status($original)) {
+        $original = original_comment_uri($r, $post, $author) ?? find_original_comment($r, $author);
+        if ($original) {
             try {
-                if (Helpers::statusFetch($original)) {
-                    $fetched++;
-
-                    continue;
-                }
+                $real = stored_status($original) ?? Helpers::statusFetch($original);
             } catch (Throwable) {
+                $real = null;
             }
+            if ($real) {
+                if ($copy && $copy->id !== $real->id) {
+                    // Keep anything attached to the copy (e.g. a reply from here).
+                    Status::where('in_reply_to_id', $copy->id)->update(['in_reply_to_id' => $real->id]);
+                    Like::where('status_id', $copy->id)->update(['status_id' => $real->id]);
+                    Status::whereKey($copy->id)->forceDelete();
+                    StatusService::del($copy->id);
+                }
+                $fetched++;
+
+                continue;
+            }
+        }
+        if ($copy) {
+            // Original not findable now; don't look again for a day.
+            Cache::put(KEY.'copy-checked:'.$copy->id, 1, 86400);
+
+            continue;
         }
         $parent = isset($r['in_reply_to_id']) && (string) $r['in_reply_to_id'] !== (string) post_remote_id($post)
             ? null
@@ -901,6 +920,60 @@ function add_comment_copies(array $comments, Status $post): array
 function post_remote_id(Status $s): ?string
 {
     return preg_match('#/(\d+)/?$#', (string) parse_url($s->uri ?? $s->object_url ?? '', PHP_URL_PATH), $m) ? $m[1] : null;
+}
+
+/**
+ * Asks the commenter's server how it sees the post: its copy of the thread
+ * lists its own users' comments under their real URLs. Matched by username
+ * and exact time.
+ */
+function original_comment_uri(array $r, Status $post, Profile $author): ?string
+{
+    $host = remote_host($author);
+    $postAuthor = remote_profile($post->profile_id);
+    if (! $postAuthor || $host === remote_host($postAuthor)) {
+        return null;
+    }
+    $map = Cache::remember(KEY.'thread:'.$post->id.':'.$host, 600, function () use ($host, $post, $postAuthor) {
+        $acct = http_json("https://{$host}/api/v1/accounts/lookup?acct=".rawurlencode(local_part($postAuthor).'@'.$postAuthor->domain));
+        $aid = is_array($acct) ? ($acct['id'] ?? null) : null;
+        if (! $aid) {
+            return [];
+        }
+        // Find the post in that server's listing of its author (3 pages).
+        $there = null;
+        $maxId = null;
+        for ($page = 0; $page < 3 && ! $there; $page++) {
+            $list = http_json("https://{$host}/api/pixelfed/v1/accounts/{$aid}/statuses?limit=24".($maxId ? "&max_id={$maxId}" : ''));
+            if (! is_array($list) || ! array_is_list($list) || ! $list) {
+                break;
+            }
+            foreach ($list as $s) {
+                if (in_array($s['uri'] ?? null, [$post->uri, $post->object_url, $post->url], true)) {
+                    $there = (string) $s['id'];
+                }
+            }
+            $maxId = end($list)['id'] ?? null;
+        }
+        if (! $there) {
+            return [];
+        }
+        $map = [];
+        $url = "https://{$host}/api/v2/comments/{$aid}/status/{$there}";
+        for ($page = 0; $url && $page < 5; $page++) {
+            $res = http_json($url);
+            foreach ($res['data'] ?? [] as $c) {
+                if (! empty($c['account']['local']) && is_string($c['uri'] ?? null)) {
+                    $map[mb_strtolower((string) ($c['account']['username'] ?? '')).'|'.substr((string) ($c['created_at'] ?? ''), 0, 19)] = $c['uri'];
+                }
+            }
+            $url = $res['meta']['pagination']['links']['next'] ?? null;
+        }
+
+        return $map;
+    });
+
+    return $map[mb_strtolower(local_part($author)).'|'.substr((string) ($r['created_at'] ?? ''), 0, 19)] ?? null;
 }
 
 /** Finds a comment on its author's server by its exact time (Mastodon API servers). */

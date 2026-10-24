@@ -63,10 +63,13 @@ Where remote data comes from:
 - **Comments:** Mastodon's `/api/v1/statuses/{id}/context` (whole thread), or
   Pixelfed's public `/api/v2/comments/{account}/status/{id}`, including replies
   to comments (2 levels deep). Pixelfed lists comments that came from other
-  servers under its own URL, which can't be fetched. pf-sync finds the original
-  on the author's server by timestamp if that server has a Mastodon API.
-  Otherwise (Pixelfed hides comments from its public listing) it stores the
-  comment from the data given, the way Pixelfed stores remote text comments.
+  servers under its own URL, which can't be fetched (and replies to it would be
+  dropped remotely). pf-sync asks the commenter's server how it sees the thread,
+  since there the comment is local and listed under its real URL, and fetches
+  that. Mastodon-API servers are also searched by timestamp. Only if both fail
+  is the comment stored from the data given; such copies are replaced once the
+  original turns up. Replies you write to pulled comments therefore point at
+  the real comment and thread correctly on the other server.
   After each batch, pf-sync clears Pixelfed's replies cache (1 h, and the refresh
   button only clears it every 5 min), so new comments show on the next load.
 - **Likers/sharers:** Mastodon's `/api/v1/statuses/{id}/favourited_by` and `/reblogged_by`.
