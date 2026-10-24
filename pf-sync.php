@@ -3,7 +3,9 @@
 /**
  * pf-sync: fills the gaps Pixelfed leaves on small servers.
  *
- *   - backfills the last public media posts of remote accounts you open or follow
+ *   - backfills recent public media posts of remote accounts you open or follow
+ *   - loads older posts when you scroll to the end of a remote profile
+ *   - fetches comments and like/repost/comment counts when you open a remote post
  *   - shows the follower/following/post counts the remote server publishes
  *   - re-syncs followed accounts periodically to catch posts federation missed
  *   - pulls trending posts from large servers into the network timeline
@@ -11,13 +13,14 @@
  * Runs inside the Pixelfed web container, fed on stdin so nothing has to be
  * mounted or patched:
  *
- *   docker exec -i -u www-data <web-container> php -- tick [profileId ...] < pf-sync.php
+ *   docker exec -i -u www-data <web-container> php -- tick [open:ID scroll:ID post:ID ...] < pf-sync.php
  *
- * Commands: tick [ids...] | trending [--force] | backfill <id|@user@domain> | status
+ * Commands: tick [...] | trending [--force] | backfill <id|@user@domain> | post <id> | status
  *
+ * Settings are PF_SYNC_* environment variables (see README / pf-sync.env).
  * Only public posts can be fetched: remote servers serve nothing else without
  * an accepted follow. Fetching goes through Pixelfed's own Helpers::statusFetch,
- * so Pixelfed handles storage, the network timeline and home feed inserts.
+ * so Pixelfed handles storage, avatars, the network timeline and home feeds.
  */
 
 declare(strict_types=1);
@@ -39,26 +42,69 @@ use App\Models\Status;
 use App\Services\AccountService;
 use App\Services\ActivityPubFetchService;
 use App\Services\HomeTimelineService;
+use App\Services\StatusService;
 use App\Util\ActivityPub\Helpers;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 
-const BACKFILL_LIMIT = 20;              // posts per account, as discussed
-const BACKFILL_COOLDOWN = 6 * 3600;     // re-sync an account at most this often
+/** Reads PF_SYNC_<key>, typed after its default. */
+function cfg(string $key, int|bool|string $default): int|bool|string
+{
+    $v = getenv('PF_SYNC_'.$key);
+    if ($v === false || $v === '') {
+        return $default;
+    }
+
+    return match (true) {
+        is_bool($default) => filter_var($v, FILTER_VALIDATE_BOOLEAN),
+        is_int($default) => (int) $v,
+        default => $v,
+    };
+}
+
+define('BACKFILL_LIMIT', cfg('BACKFILL_LIMIT', 20));
+define('RESYNC_SECONDS', cfg('RESYNC_HOURS', 6) * 3600);
+define('SCROLL_BACKFILL', cfg('SCROLL_BACKFILL', true));
+define('SCROLL_BATCH', cfg('SCROLL_BATCH', 20));
+define('SCROLL_MAX_POSTS', cfg('SCROLL_MAX_POSTS', 240));
+define('POST_DETAILS', cfg('POST_DETAILS', true));
+define('POST_REPLIES_MAX', cfg('POST_REPLIES_MAX', 40));
+define('POST_COOLDOWN', cfg('POST_COOLDOWN_MINUTES', 10) * 60);
+define('TRENDING', cfg('TRENDING', true));
+define('TRENDING_INTERVAL', cfg('TRENDING_INTERVAL_MINUTES', 30) * 60);
+define('TRENDING_MAX_PER_RUN', cfg('TRENDING_MAX_PER_RUN', 80));
+define('TRENDING_SKIP_SENSITIVE', cfg('TRENDING_SKIP_SENSITIVE', true));
+define('TRENDING_SOURCES', preg_split('/\s+/', trim((string) cfg(
+    'TRENDING_SOURCES',
+    'https://pixelfed.social/api/pixelfed/v2/discover/posts/trending?range=daily '
+    .'https://mastodon.social/api/v1/trends/statuses?limit=40'
+)), -1, PREG_SPLIT_NO_EMPTY));
+
+define('INDEX', cfg('INDEX', true));
+define('INDEX_INTERVAL', cfg('INDEX_INTERVAL_HOURS', 24) * 3600);
+define('INDEX_PAGES', cfg('INDEX_PAGES', 10));
+define('INDEX_MIN_FOLLOWERS', cfg('INDEX_MIN_FOLLOWERS', 1000));
+define('INDEX_MAX_PER_RUN', cfg('INDEX_MAX_PER_RUN', 200));
+define('INDEX_SOURCES', preg_split('/\s+/', trim((string) cfg(
+    'INDEX_SOURCES',
+    'https://mastodon.social https://mastodon.online https://mstdn.social https://mas.to https://fosstodon.org'
+)), -1, PREG_SPLIT_NO_EMPTY));
+define('SEARCH_LOOKUP', cfg('SEARCH_LOOKUP', true));
+define('SEARCH_SERVERS', preg_split('/\s+/', trim((string) cfg('SEARCH_SERVERS', 'https://mastodon.social')), -1, PREG_SPLIT_NO_EMPTY));
+define('SEARCH_MAX_IMPORTS', cfg('SEARCH_MAX_IMPORTS', 5));
+define('SEARCH_MIN_FOLLOWERS', cfg('SEARCH_MIN_FOLLOWERS', 10));
+
 const MAX_BACKFILLS_PER_TICK = 5;       // keeps one tick short
+const MAX_SEARCHES_PER_TICK = 3;
+const SEARCH_COOLDOWN = 3600;           // per query
+const PENDING_COUNTS_SECONDS = 300;
 const MAX_COUNT_FETCHES_PER_TICK = 10;
-const COUNTS_TTL = 12 * 3600;           // how long remote counts are trusted
+const COUNTS_TTL = 12 * 3600;           // how long remote profile counts are trusted
 const TRACK_DAYS = 30;                  // keep showing counts for opened profiles this long
+const CURSOR_TTL = 7 * 86400;
+const SCROLL_COOLDOWN = 15;
+const SCROLL_MAX_PAGES = 10;            // pages to skip over when they hold nothing new
 const OUTBOX_MAX_PAGES = 5;
-
-const TRENDING_INTERVAL = 30 * 60;
-const TRENDING_MAX_PER_RUN = 80;
-const TRENDING_SOURCES = [
-    // [name, url] - both return Mastodon-style status JSON lists
-    ['pixelfed.social', 'https://pixelfed.social/api/pixelfed/v2/discover/posts/trending?range=daily'],
-    ['mastodon.social', 'https://mastodon.social/api/v1/trends/statuses?limit=40'],
-];
-
 const AS_PUBLIC = ['https://www.w3.org/ns/activitystreams#Public', 'as:Public', 'Public'];
 const KEY = 'pfsync:';
 
@@ -106,15 +152,51 @@ function remote_host(Profile $p): string
     return parse_url($p->remote_url ?? '', PHP_URL_HOST) ?: $p->domain;
 }
 
-function already_stored(string $uri): bool
+/** The account's id on its own server, needed for its public APIs. */
+function remote_account_id(Profile $p): ?string
+{
+    $key = KEY.'rid:'.$p->id;
+    if ($rid = Cache::get($key)) {
+        return (string) $rid;
+    }
+    $acct = http_json('https://'.remote_host($p).'/api/v1/accounts/lookup?acct='.rawurlencode(local_part($p)));
+    $rid = is_array($acct) && isset($acct['id']) ? (string) $acct['id'] : null;
+    if ($rid) {
+        Cache::put($key, $rid, CURSOR_TTL);
+    }
+
+    return $rid;
+}
+
+function stored_status(string $uri): ?Status
 {
     return Status::withTrashed()
         ->where(fn ($q) => $q->where('uri', $uri)->orWhere('object_url', $uri)->orWhere('url', $uri))
-        ->exists();
+        ->first();
 }
 
-/** Mastodon-style status JSON → AP id if it is a public, non-reply post with media. */
-function wanted_api_status(array $s, bool $skipSensitive): ?string
+/** Like/repost/comment counts from Mastodon-style status JSON (Pixelfed uses reply_count). */
+function api_counts(array $s): array
+{
+    return array_filter([
+        'likes_count' => $s['favourites_count'] ?? null,
+        'reblogs_count' => $s['reblogs_count'] ?? null,
+        'reply_count' => $s['replies_count'] ?? $s['reply_count'] ?? null,
+    ], 'is_int');
+}
+
+/** Follower/following/post counts from Mastodon-style account JSON. */
+function account_counts(mixed $a): array
+{
+    return is_array($a) ? array_filter([
+        'followers_count' => $a['followers_count'] ?? null,
+        'following_count' => $a['following_count'] ?? null,
+        'status_count' => $a['statuses_count'] ?? null,
+    ], 'is_int') : [];
+}
+
+/** Mastodon-style status JSON → item if it is a public, non-reply post with media. */
+function wanted_api_status(array $s, bool $skipSensitive): ?array
 {
     if (! empty($s['reblog']) || ! empty($s['in_reply_to_id'])) {
         return null;
@@ -127,50 +209,73 @@ function wanted_api_status(array $s, bool $skipSensitive): ?string
     }
     $uri = $s['uri'] ?? $s['url'] ?? null;
 
-    return is_string($uri) && str_starts_with($uri, 'https://') ? $uri : null;
+    return is_string($uri) && str_starts_with($uri, 'https://')
+        ? ['uri' => $uri, 'counts' => api_counts($s), 'author' => account_counts($s['account'] ?? null)]
+        : null;
+}
+
+function api_url(array $c, int $limit): string
+{
+    $page = $c['max_id'] ? '&max_id='.$c['max_id'] : '';
+
+    return $c['kind'] === 'pixelfed'
+        ? "https://{$c['host']}/api/pixelfed/v1/accounts/{$c['rid']}/statuses?limit=".min($limit, 24).$page
+        : "https://{$c['host']}/api/v1/accounts/{$c['rid']}/statuses?only_media=true&exclude_replies=true&exclude_reblogs=true&limit=".min($limit, 40).$page;
+}
+
+function api_page(array $c, array $list, int $limit): array
+{
+    $items = array_values(array_filter(array_map(fn ($s) => is_array($s) ? wanted_api_status($s, false) : null, $list)));
+    $last = end($list);
+    $next = count($list) >= min($limit, $c['kind'] === 'pixelfed' ? 24 : 40) && is_array($last) && isset($last['id'])
+        ? [...$c, 'max_id' => (string) $last['id']]
+        : null;
+
+    return [$items, $next];
 }
 
 /**
- * Lists up to BACKFILL_LIMIT recent public media posts of a remote account,
- * newest first. Tries, in order: Pixelfed's public profile API (Pixelfed has
+ * One page of an account's public media posts, newest first: [items, next cursor or null].
+ * The first page probes, in order: Pixelfed's public profile API (Pixelfed has
  * no usable outbox), Mastodon's public account API, then the ActivityPub outbox.
  */
-function remote_recent_posts(Profile $p): array
+function remote_page(Profile $p, ?array $cursor, int $limit): array
 {
-    $host = remote_host($p);
-    $acct = http_json("https://{$host}/api/v1/accounts/lookup?acct=".rawurlencode(local_part($p)));
-    $rid = is_array($acct) ? ($acct['id'] ?? null) : null;
-
-    if ($rid) {
-        $sources = [
-            "https://{$host}/api/pixelfed/v1/accounts/{$rid}/statuses?limit=".BACKFILL_LIMIT,
-            "https://{$host}/api/v1/accounts/{$rid}/statuses?only_media=true&exclude_replies=true&exclude_reblogs=true&limit=".BACKFILL_LIMIT,
-        ];
-        foreach ($sources as $url) {
-            $list = http_json($url);
+    if ($cursor === null) {
+        $rid = remote_account_id($p);
+        foreach ($rid ? ['pixelfed', 'mastodon'] : [] as $kind) {
+            $c = ['kind' => $kind, 'host' => remote_host($p), 'rid' => $rid, 'max_id' => null];
+            $list = http_json(api_url($c, $limit));
             if (is_array($list) && array_is_list($list)) {
-                $uris = array_values(array_filter(array_map(fn ($s) => is_array($s) ? wanted_api_status($s, false) : null, $list)));
-                if ($uris) {
-                    return array_slice($uris, 0, BACKFILL_LIMIT);
-                }
+                return api_page($c, $list, $limit);
             }
         }
+        $cursor = ['kind' => 'outbox', 'next' => null];
     }
 
-    return outbox_recent_posts($p);
+    if ($cursor['kind'] !== 'outbox') {
+        $list = http_json(api_url($cursor, $limit));
+
+        // Keep the cursor on a failed request so the next scroll retries it.
+        return is_array($list) && array_is_list($list) ? api_page($cursor, $list, $limit) : [[], $cursor];
+    }
+
+    return outbox_page($p, $cursor['next'], $limit);
 }
 
-function outbox_recent_posts(Profile $p): array
+function outbox_page(Profile $p, ?string $pageUrl, int $limit): array
 {
-    $outbox = ap_json($p->outbox_url);
-    if (! $outbox) {
-        return [];
+    if ($pageUrl) {
+        $page = ap_json($pageUrl);
+    } else {
+        $outbox = ap_json($p->outbox_url);
+        $first = $outbox['first'] ?? null;
+        $page = is_string($first) ? ap_json($first) : (is_array($first) ? $first : $outbox);
     }
-    $page = $outbox['first'] ?? null;
-    $page = is_string($page) ? ap_json($page) : (is_array($page) ? $page : $outbox);
 
-    $uris = [];
-    for ($i = 0; $page && $i < OUTBOX_MAX_PAGES && count($uris) < BACKFILL_LIMIT; $i++) {
+    $items = [];
+    $next = null;
+    for ($i = 0; $page && $i < OUTBOX_MAX_PAGES && count($items) < $limit; $i++) {
         foreach ($page['orderedItems'] ?? $page['items'] ?? [] as $act) {
             $obj = is_array($act) && ($act['type'] ?? null) === 'Create' ? ($act['object'] ?? null) : null;
             if (! is_array($obj) || ! empty($obj['inReplyTo']) || ! is_string($obj['id'] ?? null)) {
@@ -181,32 +286,174 @@ function outbox_recent_posts(Profile $p): array
                 fn ($a) => is_array($a) && preg_match('#^(image|video)/#', (string) ($a['mediaType'] ?? ''))
             );
             if ($hasMedia && array_intersect(AS_PUBLIC, $to)) {
-                $uris[] = $obj['id'];
+                $items[] = ['uri' => $obj['id'], 'counts' => []];
             }
         }
-        $next = $page['next'] ?? null;
-        $page = is_string($next) ? ap_json($next) : null;
+        $next = is_string($page['next'] ?? null) ? $page['next'] : null;
+        $page = $next && count($items) < $limit ? ap_json($next) : null;
     }
 
-    return array_slice($uris, 0, BACKFILL_LIMIT);
+    return [array_slice($items, 0, $limit), $next ? ['kind' => 'outbox', 'next' => $next] : null];
 }
 
-/** Fetches the given AP ids through Pixelfed, oldest first so feed order stays right. */
-function fetch_posts(array $uris): array
+/**
+ * Writes remote like/repost/comment counts onto a stored post. Pixelfed only
+ * counts what reached this server, so these would otherwise stay near 0.
+ */
+function apply_post_counts(Status $s, array $counts): bool
+{
+    $changes = [];
+    foreach ($counts as $field => $value) {
+        if ((int) $s->{$field} !== $value) {
+            $changes[$field] = $value;
+        }
+    }
+    if (! $changes) {
+        return false;
+    }
+    Status::whereKey($s->id)->update($changes);
+    StatusService::del($s->id);
+
+    return true;
+}
+
+/**
+ * Fetches items through Pixelfed, oldest first so feed order stays right,
+ * then applies their counts (to already stored posts too). Returns [new, failed].
+ */
+function fetch_items(array $items): array
 {
     $new = $failed = 0;
-    foreach (array_reverse($uris) as $uri) {
-        if (already_stored($uri)) {
+    foreach (array_reverse($items) as $item) {
+        if (stored_status($item['uri'])) {
             continue;
         }
         try {
-            Helpers::statusFetch($uri) ? $new++ : $failed++;
+            Helpers::statusFetch($item['uri']) ? $new++ : $failed++;
         } catch (Throwable) {
             $failed++;
         }
     }
+    foreach ($items as $item) {
+        if (! ($s = stored_status($item['uri']))) {
+            continue;
+        }
+        if ($item['counts']) {
+            apply_post_counts($s, $item['counts']);
+        }
+        // Real author counts make them rank properly in search and Discover.
+        if (! empty($item['author']) && ($author = remote_profile($s->profile_id))) {
+            apply_counts($author, $item['author']);
+        }
+    }
 
     return [$new, $failed];
+}
+
+/**
+ * Makes a remote account known to this server so Pixelfed's own search and
+ * "Popular accounts" (both ranked by followers) can find it.
+ * Directory crawls only take accounts that opted into discovery; an explicit
+ * search takes any account, like the remote server's own search does.
+ * Returns new, known, skipped or failed.
+ */
+function import_account(array $a, bool $fromDirectory): string
+{
+    $uri = $a['uri'] ?? null;
+    if (! is_string($uri) || ! str_starts_with($uri, 'https://') || ! empty($a['suspended']) || ! empty($a['moved'])
+        || ($fromDirectory && (($a['discoverable'] ?? null) !== true || ! empty($a['noindex'])))) {
+        return 'skipped';
+    }
+    $p = Profile::where('remote_url', $uri)->whereNotNull('domain')->first();
+    $status = $p ? 'known' : 'new';
+    if (! $p) {
+        try {
+            $p = Helpers::profileFetch($uri);
+        } catch (Throwable) {
+            $p = null;
+        }
+    }
+    if (! $p || ! $p->domain) {
+        return 'failed';
+    }
+    apply_counts($p, account_counts($a));
+
+    return $status;
+}
+
+/** Periodic crawl of public account directories (opt-in "discoverable" accounts only). */
+function cmd_index(bool $force): void
+{
+    if (! INDEX || (! $force && Cache::has(KEY.'index'))) {
+        return;
+    }
+    Cache::put(KEY.'index', time(), max(3600, INDEX_INTERVAL - 300));
+
+    $budget = INDEX_MAX_PER_RUN;
+    $summary = [];
+    foreach (INDEX_SOURCES as $base) {
+        $base = rtrim($base, '/');
+        $tally = ['new' => 0, 'known' => 0, 'skipped' => 0, 'failed' => 0];
+        $seen = 0;
+        for ($page = 0; $page < INDEX_PAGES && $budget > 0; $page++) {
+            $list = http_json("{$base}/api/v1/directory?order=active&local=true&limit=80&offset=".($page * 80));
+            if (! is_array($list) || ! array_is_list($list) || ! $list) {
+                break;
+            }
+            $seen += count($list);
+            foreach ($list as $a) {
+                if (! is_array($a) || ($a['followers_count'] ?? 0) < INDEX_MIN_FOLLOWERS) {
+                    continue;
+                }
+                if ($budget <= 0) {
+                    break;
+                }
+                $r = import_account($a, true);
+                $tally[$r]++;
+                if ($r === 'new' || $r === 'failed') {
+                    $budget--;
+                }
+            }
+        }
+        $summary[] = sprintf('%s: %d listed, %d new, %d updated, %d skipped, %d failed',
+            parse_url($base, PHP_URL_HOST), $seen, $tally['new'], $tally['known'], $tally['skipped'], $tally['failed']);
+    }
+    out('index '.implode('; ', $summary));
+}
+
+/**
+ * Someone searched for a name: look it up on large servers and import the most
+ * followed matches, so a search a few seconds later finds them here.
+ */
+function lookup_search(string $q): void
+{
+    $q = trim(ltrim(trim($q), '@'));
+    if (! SEARCH_LOOKUP || mb_strlen($q) < 3 || str_contains($q, '@') || str_starts_with($q, '#') || preg_match('#^https?://#', $q)
+        || ! Cache::add(KEY.'search:'.md5(mb_strtolower($q)), 1, SEARCH_COOLDOWN)) {
+        return;
+    }
+    // Pixelfed's search only matches the start of a handle, so other matches
+    // (display names, bios) would never show up for this query.
+    $prefix = mb_strtolower($q);
+    $found = [];
+    foreach (SEARCH_SERVERS as $base) {
+        $res = http_json(rtrim($base, '/').'/api/v2/search?type=accounts&limit=20&q='.rawurlencode($q));
+        foreach ($res['accounts'] ?? [] as $a) {
+            if (is_array($a) && is_string($a['uri'] ?? null) && ($a['followers_count'] ?? 0) >= SEARCH_MIN_FOLLOWERS
+                && str_starts_with(mb_strtolower((string) ($a['acct'] ?? '')), $prefix)) {
+                $found[$a['uri']] = $a;
+            }
+        }
+    }
+    usort($found, fn ($a, $b) => ($b['followers_count'] ?? 0) <=> ($a['followers_count'] ?? 0));
+    $tally = ['new' => 0, 'known' => 0, 'skipped' => 0, 'failed' => 0];
+    foreach (array_slice($found, 0, SEARCH_MAX_IMPORTS) as $a) {
+        $tally[import_account($a, false)]++;
+    }
+    if ($tally['new'] || $tally['failed']) {
+        out(sprintf('search "%s": %d new, %d known, %d failed (%s)', $q, $tally['new'], $tally['known'], $tally['failed'],
+            implode(', ', array_map(fn ($a) => $a['acct'].' '.$a['followers_count'], array_slice($found, 0, SEARCH_MAX_IMPORTS)))));
+    }
 }
 
 /** Remote follower/following/post counts from the actor's collections, cached. */
@@ -257,30 +504,148 @@ function apply_counts(Profile $p, ?array $counts): bool
     return true;
 }
 
+/** Pixelfed only pushes posts younger than 7 days into an existing home feed. */
+function rebuild_follower_feeds(Profile $p): void
+{
+    $local = Profile::whereNull('domain')->whereNotNull('user_id')->pluck('id');
+    $followers = Follower::where('following_id', $p->id)->whereIn('profile_id', $local)->pluck('profile_id');
+    foreach ($followers as $pid) {
+        if (HomeTimelineService::cacheKeyExists($pid)) {
+            HomeTimelineService::warmCache($pid, true, 400);
+        }
+    }
+}
+
+function save_cursor(Profile $p, ?array $next): void
+{
+    Cache::put(KEY.'cursor:'.$p->id, $next ?? ['kind' => 'done'], CURSOR_TTL);
+}
+
 function backfill(Profile $p, string $why): void
 {
-    $uris = remote_recent_posts($p);
-    [$new, $failed] = fetch_posts($uris);
+    [$items, $next] = remote_page($p, null, BACKFILL_LIMIT);
+    [$new, $failed] = fetch_items($items);
+    // Keep an older scroll position: re-syncs only need the newest page.
+    if ($why !== 'followed' || ! Cache::has(KEY.'cursor:'.$p->id)) {
+        save_cursor($p, $next);
+    }
     $counts = remote_counts($p, true);
     apply_counts($p->fresh(), $counts);
-    Cache::put(KEY.'backfilled:'.$p->id, time(), BACKFILL_COOLDOWN);
-
-    // Pixelfed only pushes posts younger than 7 days into an existing home
-    // feed, so rebuild the feeds of local followers to include the backfill.
+    Cache::put(KEY.'backfilled:'.$p->id, time(), RESYNC_SECONDS);
     if ($new > 0) {
-        $local = Profile::whereNull('domain')->whereNotNull('user_id')->pluck('id');
-        $followers = Follower::where('following_id', $p->id)->whereIn('profile_id', $local)->pluck('profile_id');
-        foreach ($followers as $pid) {
-            if (HomeTimelineService::cacheKeyExists($pid)) {
-                HomeTimelineService::warmCache($pid, true, 400);
-            }
-        }
+        rebuild_follower_feeds($p);
     }
 
     out(sprintf(
         'backfill %s (%s): %d listed, %d new, %d failed; counts %s',
-        $p->username, $why, count($uris), $new, $failed, json_encode($counts)
+        $p->username, $why, count($items), $new, $failed, json_encode($counts)
     ));
+}
+
+/** Someone reached the end of a remote profile: load the next older batch. */
+function scroll(Profile $p): void
+{
+    if (! SCROLL_BACKFILL || ! Cache::add(KEY.'scrolled:'.$p->id, 1, SCROLL_COOLDOWN)) {
+        return;
+    }
+    $stored = Status::where('profile_id', $p->id)->whereNull('in_reply_to_id')->count();
+    if ($stored >= SCROLL_MAX_POSTS) {
+        return;
+    }
+    $cursor = Cache::get(KEY.'cursor:'.$p->id);
+    if (($cursor['kind'] ?? null) === 'done') {
+        return;
+    }
+
+    // Without a saved position, walk from the newest page past what is stored.
+    $limit = min(SCROLL_BATCH, SCROLL_MAX_POSTS - $stored);
+    $new = $failed = $pages = 0;
+    do {
+        [$items, $next] = remote_page($p, $cursor, $limit);
+        [$n, $f] = fetch_items($items);
+        $new += $n;
+        $failed += $f;
+        $retry = $cursor !== null && $next === $cursor;
+        $cursor = $next;
+        $pages++;
+    } while ($new === 0 && $cursor && ! $retry && $pages < SCROLL_MAX_PAGES);
+    if (! $retry) {
+        save_cursor($p, $cursor);
+    }
+
+    out(sprintf(
+        'scroll %s: %d new, %d failed over %d page(s)%s',
+        $p->username, $new, $failed, $pages, $cursor ? '' : '; reached the oldest public post'
+    ));
+}
+
+/**
+ * A remote post was opened: fetch its comments (Mastodon: the reply thread,
+ * Pixelfed: its public comments API) and refresh like/repost/comment counts.
+ * Pixelfed fetches avatars of the comment authors itself.
+ */
+function open_post(int|string $id): void
+{
+    if (! POST_DETAILS || ! Cache::add(KEY.'post:'.$id, 1, POST_COOLDOWN)) {
+        return;
+    }
+    $s = Status::whereKey($id)->where('local', false)->first();
+    $author = $s ? remote_profile($s->profile_id) : null;
+    $uri = $s?->uri ?? $s?->object_url;
+    if (! $author || ! $uri || ! preg_match('#/(\d+)/?$#', (string) parse_url($uri, PHP_URL_PATH), $m)) {
+        return;
+    }
+    $host = parse_url($uri, PHP_URL_HOST);
+    $rid = $m[1];
+
+    $replies = [];
+    $counts = [];
+    $remote = http_json("https://{$host}/api/v1/statuses/{$rid}");
+    if (is_array($remote) && isset($remote['id'])) {
+        $counts = api_counts($remote);
+        $ctx = http_json("https://{$host}/api/v1/statuses/{$rid}/context");
+        foreach ($ctx['descendants'] ?? [] as $r) {
+            if (is_string($r['uri'] ?? null) && in_array($r['visibility'] ?? null, ['public', 'unlisted'], true)) {
+                $replies[] = ['uri' => $r['uri'], 'counts' => api_counts($r)];
+            }
+        }
+    } elseif ($arid = remote_account_id($author)) {
+        // Pixelfed's single-post API needs a login; its public profile listing
+        // starting just above this post's id returns the post with its counts.
+        $one = http_json(api_url(['kind' => 'pixelfed', 'host' => $host, 'rid' => $arid, 'max_id' => (string) ((int) $rid + 1)], 1));
+        if (is_array($one) && is_array($one[0] ?? null) && (string) ($one[0]['id'] ?? '') === $rid) {
+            $counts = api_counts($one[0]);
+        }
+        $url = "https://{$host}/api/v2/comments/{$arid}/status/{$rid}";
+        while ($url && count($replies) < POST_REPLIES_MAX) {
+            $page = http_json($url);
+            foreach ($page['data'] ?? [] as $r) {
+                if (is_string($r['uri'] ?? null)) {
+                    $replies[] = ['uri' => $r['uri'], 'counts' => api_counts($r)];
+                }
+            }
+            $total = $page['meta']['pagination']['total'] ?? null;
+            if (is_int($total)) {
+                $counts['reply_count'] = $total;
+            }
+            $url = $page['meta']['pagination']['links']['next'] ?? null;
+        }
+    }
+
+    // fetch_items works back to front; reversing first keeps Mastodon's
+    // parent-before-child thread order.
+    $replies = array_slice($replies, 0, POST_REPLIES_MAX);
+    [$new, $failed] = fetch_items(array_reverse($replies));
+    // Pixelfed's queue bumps reply_count for every fetched reply, partly after
+    // this returns, so the counts are also re-applied by the next ticks.
+    apply_post_counts($s->fresh(), $counts);
+    if ($counts) {
+        $pending = Cache::get(KEY.'pending-counts', []);
+        $pending[(string) $s->id] = ['counts' => $counts, 'until' => time() + PENDING_COUNTS_SECONDS];
+        Cache::forever(KEY.'pending-counts', $pending);
+    }
+
+    out(sprintf('post %s: %d comments listed, %d new, %d failed; counts %s', $uri, count($replies), $new, $failed, json_encode($counts)));
 }
 
 function remote_profile(int|string $id): ?Profile
@@ -301,26 +666,33 @@ function followed_remote_ids(): array
     return Profile::whereIn('id', $ids)->whereNotNull('domain')->pluck('id')->map(fn ($v) => (string) $v)->all();
 }
 
-function cmd_tick(array $inspected): void
+/** @param array<string, list<string>> $events open/scroll/post => ids */
+function cmd_tick(array $events): void
 {
     $now = time();
     $tracked = array_filter(Cache::get(KEY.'tracked', []), fn ($ts) => $ts > $now - TRACK_DAYS * 86400);
     $followed = followed_remote_ids();
 
-    $inspectedProfiles = array_filter(array_map('remote_profile', array_unique($inspected)));
-    foreach ($inspectedProfiles as $p) {
-        $tracked[(string) $p->id] = $now;
+    // Things someone is looking at right now go first.
+    foreach (final_queries($events['search']) as $q) {
+        lookup_search($q);
     }
-    foreach ($followed as $id) {
-        $tracked[$id] = $now;
+    foreach (array_unique($events['post']) as $id) {
+        open_post($id);
+    }
+    foreach (array_filter(array_map('remote_profile', array_unique($events['scroll']))) as $p) {
+        $tracked[(string) $p->id] = $now;
+        scroll($p);
     }
 
-    // Opened profiles first (someone is looking at them), then follows.
+    $opened = array_filter(array_map('remote_profile', array_unique($events['open'])));
     $queue = [];
-    foreach ($inspectedProfiles as $p) {
+    foreach ($opened as $p) {
+        $tracked[(string) $p->id] = $now;
         $queue[(string) $p->id] = 'opened';
     }
     foreach ($followed as $id) {
+        $tracked[$id] = $now;
         $queue[$id] ??= 'followed';
     }
     $done = 0;
@@ -352,27 +724,38 @@ function cmd_tick(array $inspected): void
     }
 
     Cache::forever(KEY.'tracked', $tracked);
+
+    $pending = array_filter(Cache::get(KEY.'pending-counts', []), fn ($p) => $p['until'] > $now);
+    foreach ($pending as $id => $p) {
+        if ($s = Status::find($id)) {
+            apply_post_counts($s, $p['counts']);
+        }
+    }
+    Cache::forever(KEY.'pending-counts', $pending);
 }
 
 function cmd_trending(bool $force): void
 {
-    if (! $force && Cache::has(KEY.'trending')) {
+    if (! TRENDING || (! $force && Cache::has(KEY.'trending'))) {
         return;
     }
-    Cache::put(KEY.'trending', time(), TRENDING_INTERVAL - 30);
+    Cache::put(KEY.'trending', time(), max(60, TRENDING_INTERVAL - 30));
 
     $summary = [];
     $budget = TRENDING_MAX_PER_RUN;
-    foreach (TRENDING_SOURCES as [$name, $url]) {
+    foreach (TRENDING_SOURCES as $url) {
+        $name = parse_url($url, PHP_URL_HOST) ?: $url;
         $list = http_json($url);
         if (! is_array($list) || ! array_is_list($list)) {
             $summary[] = "{$name}: unavailable";
 
             continue;
         }
-        $uris = array_values(array_filter(array_map(fn ($s) => is_array($s) ? wanted_api_status($s, true) : null, $list)));
-        $uris = array_slice(array_values(array_filter($uris, fn ($u) => ! already_stored($u))), 0, max(0, $budget));
-        [$new, $failed] = fetch_posts($uris);
+        $items = array_values(array_filter(array_map(fn ($s) => is_array($s) ? wanted_api_status($s, TRENDING_SKIP_SENSITIVE) : null, $list)));
+        $fresh = array_values(array_filter($items, fn ($i) => ! stored_status($i['uri'])));
+        $known = array_filter($items, fn ($i) => ! in_array($i, $fresh, true));
+        // Known posts only get their counts refreshed.
+        [$new, $failed] = fetch_items([...array_slice($fresh, 0, max(0, $budget)), ...$known]);
         $budget -= $new + $failed;
         $summary[] = sprintf('%s: %d candidates, %d new, %d failed', $name, count($list), $new, $failed);
     }
@@ -396,10 +779,35 @@ function cmd_backfill(string $who): void
     Cache::forever(KEY.'tracked', $tracked);
 }
 
+function cmd_search(string $q): void
+{
+    Cache::forget(KEY.'search:'.md5(mb_strtolower(trim(ltrim(trim($q), '@')))));
+    lookup_search($q);
+}
+
+function cmd_post(string $id): void
+{
+    Cache::forget(KEY.'post:'.$id);
+    open_post($id);
+}
+
 function cmd_status(): void
 {
     $tracked = Cache::get(KEY.'tracked', []);
     $followed = array_flip(followed_remote_ids());
+    printf(
+        "settings: backfill %d, resync %dh, scroll %s (batch %d, max %d), post details %s (max %d comments), trending %s every %d min\n",
+        BACKFILL_LIMIT, RESYNC_SECONDS / 3600, SCROLL_BACKFILL ? 'on' : 'off', SCROLL_BATCH, SCROLL_MAX_POSTS,
+        POST_DETAILS ? 'on' : 'off', POST_REPLIES_MAX, TRENDING ? 'on' : 'off', TRENDING_INTERVAL / 60
+    );
+    printf(
+        "          index %s (>= %d followers, %d sources), search lookup %s via %s\n",
+        INDEX ? 'on' : 'off', INDEX_MIN_FOLLOWERS, count(INDEX_SOURCES),
+        SEARCH_LOOKUP ? 'on' : 'off', implode(', ', array_map(fn ($u) => parse_url($u, PHP_URL_HOST), SEARCH_SERVERS))
+    );
+    $i = Cache::get(KEY.'index');
+    echo 'remote profiles known: '.Profile::whereNotNull('domain')->count()
+        .', last index run: '.($i ? gmdate('Y-m-d H:i', (int) $i).'Z' : '-').PHP_EOL;
     echo count($tracked).' tracked profiles'.PHP_EOL;
     foreach ($tracked as $id => $ts) {
         $p = remote_profile($id);
@@ -407,12 +815,14 @@ function cmd_status(): void
             continue;
         }
         $last = Cache::get(KEY.'backfilled:'.$id);
+        $cursor = Cache::get(KEY.'cursor:'.$id);
         printf(
-            "  %-40s %s  followers=%d following=%d posts=%d (stored %d)  last sync %s\n",
+            "  %-40s %s  followers=%d following=%d posts=%d (stored %d%s)  last sync %s\n",
             $p->username,
             isset($followed[$id]) ? 'followed' : 'opened  ',
             $p->followers_count, $p->following_count, $p->status_count,
-            Status::where('profile_id', $id)->count(),
+            Status::where('profile_id', $id)->whereNull('in_reply_to_id')->count(),
+            ($cursor['kind'] ?? null) === 'done' ? ', all public' : '',
             $last ? gmdate('Y-m-d H:i', (int) $last).'Z' : '-'
         );
     }
@@ -420,12 +830,46 @@ function cmd_status(): void
     echo 'last trending run: '.($t ? gmdate('Y-m-d H:i', (int) $t).'Z' : '-').PHP_EOL;
 }
 
+/** tick arguments: open:ID, scroll:ID, post:ID, search:<url-encoded query> (a bare ID means open). */
+function parse_events(array $args): array
+{
+    $events = ['open' => [], 'scroll' => [], 'post' => [], 'search' => []];
+    foreach ($args as $arg) {
+        [$kind, $val] = str_contains($arg, ':') ? explode(':', $arg, 2) : ['open', $arg];
+        if ($kind === 'search') {
+            $events['search'][] = urldecode($val);
+        } elseif (isset($events[$kind]) && ctype_digit($val)) {
+            $events[$kind][] = $val;
+        }
+    }
+
+    return $events;
+}
+
+/** Drops queries that are prefixes of longer ones (typing "xk", "xkc", "xkcd"). */
+function final_queries(array $queries): array
+{
+    $queries = array_values(array_unique(array_map(fn ($q) => mb_strtolower(trim($q)), $queries)));
+    usort($queries, fn ($a, $b) => mb_strlen($b) <=> mb_strlen($a));
+    $keep = [];
+    foreach ($queries as $q) {
+        if (! array_filter($keep, fn ($k) => str_starts_with($k, $q))) {
+            $keep[] = $q;
+        }
+    }
+
+    return array_slice($keep, 0, MAX_SEARCHES_PER_TICK);
+}
+
 $args = array_slice($argv, 1);
 $cmd = array_shift($args) ?? 'status';
 match ($cmd) {
-    'tick' => cmd_tick(array_values(array_filter($args, 'ctype_digit'))),
+    'tick' => cmd_tick(parse_events($args)),
     'trending' => cmd_trending(in_array('--force', $args, true)),
+    'index' => cmd_index(in_array('--force', $args, true)),
+    'search' => isset($args[0]) ? cmd_search(implode(' ', $args)) : out('usage: search <name>'),
     'backfill' => isset($args[0]) ? cmd_backfill($args[0]) : out('usage: backfill <id|@user@domain>'),
+    'post' => isset($args[0]) ? cmd_post($args[0]) : out('usage: post <local status id>'),
     'status' => cmd_status(),
     default => out("unknown command {$cmd}"),
 };

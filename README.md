@@ -5,51 +5,72 @@ Makes a small or single-user [Pixelfed](https://pixelfed.org) server feel popula
 Out of the box, a new Pixelfed server:
 - shows **no posts** on remote profiles, and only receives posts made *after* you follow someone
   ([#1745](https://github.com/pixelfed/pixelfed/issues/1745), [#5294](https://github.com/pixelfed/pixelfed/issues/5294); backfill is on the [roadmap](https://github.com/pixelfed/pixelfed/issues/6750) as "a seriously hard thing to resolve")
-- shows **0 followers / 0 following / 0 posts** for every remote account, even though the remote server publishes the real numbers
+- shows **0 followers / 0 following / 0 posts** for every remote account, and near-zero likes and comments on remote posts
 - has an **empty global timeline** and no relay support ([#4472](https://github.com/pixelfed/pixelfed/issues/4472))
+- only **finds remote accounts in search** if you already know their full handle
 
 pf-sync fills those gaps without patching Pixelfed:
 
-| Gap | What pf-sync does |
+| You… | pf-sync… |
 |---|---|
-| Opening a remote profile shows no posts | Fetches its last 20 public media posts within ~15 s |
-| Following someone shows nothing until they post | Same backfill on follow (also for pending requests), and adds the posts to your home feed |
-| Federation sometimes misses posts | Re-syncs followed accounts every 6 h |
-| Remote follower/following/post counts show 0 | Reads the counts the remote server publishes and keeps them applied |
-| Empty global/network timeline | Pulls trending posts from pixelfed.social and mastodon.social every 30 min (sensitive posts skipped) |
+| open a remote profile | fetches its newest 20 public media posts and its real follower/following/post counts (~15 s) |
+| scroll to the end of it | loads the next 20 older posts, continuing on the remote server where the last batch ended |
+| follow someone | does the same backfill and adds the posts to your home feed; re-syncs followed accounts every 6 h |
+| open a remote post | fetches its comments (commenters' avatars follow automatically) and the real like/repost/comment counts |
+| search for a name, e.g. `xkcd` | looks it up on mastodon.social and imports the most followed accounts whose handle starts with it; search again a few seconds later and they're listed, most followed first |
+| open the global timeline | finds trending posts from pixelfed.social and mastodon.social, pulled in every 30 min (sensitive ones skipped) |
+| open Discover → Popular accounts | finds popular accounts from a daily crawl of public account directories |
 
-Only **public** posts can be fetched: remote servers don't serve followers-only
-posts to anyone who isn't an accepted follower.
+Only **public** content can be fetched: remote servers don't serve
+followers-only posts to anyone who isn't an accepted follower. The daily
+account index only takes accounts that opted into being discoverable and
+aren't marked `noindex`. An explicit search imports what the remote server's
+own search returns for that name.
 
 ## How it works
 
 `pf-sync.php` runs inside the Pixelfed web container and uses Pixelfed's own
-code (`Helpers::statusFetch`, signed ActivityPub fetches, the timeline
-services). So storage, the network timeline and home feeds behave as if the
-posts had federated normally. It's piped in on stdin, so nothing is mounted
-or patched, and Pixelfed upgrades leave it alone.
+code (`Helpers::statusFetch`/`profileFetch`, signed ActivityPub fetches, the
+timeline services). So storage, avatars, the network timeline and home feeds
+behave as if everything had federated normally. It's piped in on stdin, so
+nothing is mounted or patched, and Pixelfed upgrades leave it alone.
 
-Where an account's recent posts come from, in order:
-1. Pixelfed's public profile API (`/api/pixelfed/v1/accounts/{id}/statuses`).
-   Pixelfed's ActivityPub outbox is intentionally empty, so this is the only
-   way to list a Pixelfed account's posts.
-2. Mastodon's public account API (`only_media`, no replies, no boosts).
-3. The ActivityPub outbox (other software).
+`run.sh` is the cron entry point. It reads what people do from the
+container's access log, using the requests the web UI and apps make anyway.
+Only successful (HTTP 200) requests count, so logged-out visitors can't
+trigger fetches.
 
-`run.sh` is the cron entry point. It finds profiles someone *opened* in the
-container's access log: the web UI and apps request
-`GET /api/(pixelfed/)v1/accounts/<id>` when a profile is opened.
+| Event | Request |
+|---|---|
+| profile opened | `GET /api/(pixelfed/)v1/accounts/<id>` |
+| profile scrolled | `GET /api/(pixelfed/)v1/accounts/<id>/statuses?…cursor=…` (or `max_id=`) |
+| post opened | `GET /api/(pixelfed/)v1/statuses/<id>[/context]` |
+| search | `GET /api/v2/search?q=…` |
 
-State (tracked profiles, cooldowns, cached counts) lives in Pixelfed's Redis
-under `pfsync:*`, plus `state/` and `logs/` next to `run.sh`.
+Where remote data comes from:
+- **Posts:** Pixelfed's public profile API (`/api/pixelfed/v1/accounts/{id}/statuses`).
+  Pixelfed's ActivityPub outbox is intentionally empty, so this is the only way
+  to list a Pixelfed account's posts. Then Mastodon's public account API
+  (`only_media`, no replies, no boosts), then the ActivityPub outbox.
+- **Comments:** Mastodon's `/api/v1/statuses/{id}/context`, or Pixelfed's public
+  `/api/v2/comments/{account}/status/{id}`.
+- **Counts:** the remote APIs, or the actor's ActivityPub collections for profiles.
+  Pixelfed resets some counts to what it has stored locally, so pf-sync
+  re-applies them.
+- **Accounts:** Mastodon's public `/api/v1/directory` and `/api/v2/search`.
+  Pixelfed's own search and Popular accounts both rank by follower count, so
+  the real counts put popular accounts first.
+
+State (tracked profiles, scroll positions, cooldowns, cached counts) lives in
+Pixelfed's Redis under `pfsync:*`, plus `state/` and `logs/` next to `run.sh`.
 
 ## Requirements
 
 - Pixelfed running in Docker. Tested with
   [jippi/docker-pixelfed](https://github.com/jippi/docker-pixelfed) `v0.15.2-docker0`.
   The official compose setup should work too (the app root is detected), but
-  that's untested, and opened-profile detection needs the web server's access
-  log on the container's stdout.
+  that's untested, and event detection needs the web server's access log on
+  the container's stdout.
 - ActivityPub federation enabled (`ACTIVITY_PUB="true"` etc.).
 - A host user that can run `docker` and has `cron`, `flock` and bash.
 
@@ -63,19 +84,31 @@ crontab -e
 ```cron
 * * * * *     $HOME/pixelfed-sync/run.sh
 */30 * * * *  $HOME/pixelfed-sync/run.sh trending
+17 * * * *    $HOME/pixelfed-sync/run.sh index
 ```
 
-`run.sh` uses the one running container whose Compose service is `web` or
-`pixelfed` and whose image name contains `pixelfed`. If that's ambiguous, or
-your setup differs, create `pf-sync.env` next to `run.sh`:
+(`index` only crawls once per `PF_SYNC_INDEX_INTERVAL_HOURS`; the hourly entry
+just retries if a run was missed.)
 
-```bash
-PF_SYNC_WEB_CONTAINER="my-pixelfed-web"
-# PF_SYNC_APP_ROOT="/var/www/html"   # only if auto-detection fails
-```
+## Configuration
 
-Limits (posts per account, cooldowns) and trending sources are constants at
-the top of `pf-sync.php`.
+Copy `pf-sync.env.example` to `pf-sync.env` and uncomment what you want to
+change. Every feature can be switched off and its limits adjusted. Main settings:
+
+| Setting | Default | |
+|---|---|---|
+| `PF_SYNC_WEB_CONTAINER` | auto | the one running compose service `web`/`pixelfed` with a `pixelfed` image |
+| `PF_SYNC_BACKFILL_LIMIT` | `20` | posts fetched when a profile is opened or followed |
+| `PF_SYNC_SCROLL_BACKFILL` / `_BATCH` / `_MAX_POSTS` | `true` / `20` / `240` | older posts on scroll |
+| `PF_SYNC_POST_DETAILS` / `_REPLIES_MAX` | `true` / `40` | comments + counts when a post is opened |
+| `PF_SYNC_TRENDING` / `_SOURCES` | `true` / pixelfed.social, mastodon.social | global timeline |
+| `PF_SYNC_INDEX` / `_MIN_FOLLOWERS` / `_SOURCES` | `true` / `1000` / 5 large servers | account index |
+| `PF_SYNC_SEARCH_LOOKUP` / `_SERVERS` | `true` / mastodon.social | search lookup |
+
+**Privacy:** search lookup sends what users type into the search bar (3+
+characters, no full handles) to `PF_SYNC_SEARCH_SERVERS`. Set
+`PF_SYNC_SEARCH_LOOKUP=false` to keep searches local; the directory index still
+works without it.
 
 ## Commands
 
@@ -84,28 +117,35 @@ cd ~/pixelfed-sync
 WEB=my-pixelfed-web   # your web container
 run() { docker exec -i -u www-data "$WEB" php -- "$@" < pf-sync.php; }
 
-run status                        # tracked profiles, counts, last syncs
+run status                        # settings, tracked profiles, counts, last runs
 run backfill @user@example.social # backfill now (search the account in Pixelfed first)
+run post <local post id>          # fetch comments and counts for a post now
+run search xkcd                   # search lookup now
 run trending --force              # trending run now
+run index --force                 # directory crawl now
 tail -f logs/sync.log
 ```
 
 ## Uninstall
 
-Remove the two crontab lines and `~/pixelfed-sync`. Posts that were fetched
-stay; remote counts drift back to Pixelfed's own values.
+Remove the crontab lines and `~/pixelfed-sync`. Fetched posts and accounts
+stay; counts drift back to Pixelfed's own values.
 
 ## Caveats
 
 - It calls internal Pixelfed classes, so a future Pixelfed release may need
   small adjustments. Errors show up in `logs/sync.log`.
-- Backfilled posts get new local IDs, so in ID-ordered views they sort as if
-  just received (within a batch the order stays chronological).
+- Things appear on the *next* load: Pixelfed's web UI doesn't refresh by
+  itself. Scroll again, reopen the post or repeat the search after ~15 s.
+- Backfilled posts get new local IDs, so ID-ordered views (home, global) sort
+  them as if just received. Profiles sort by date and aren't affected.
+- Fetching Mastodon comments takes ~2–3 s each, so a long thread can take a
+  minute or two.
 - Pixelfed itself only puts posts from the last 7 days into home feeds.
   pf-sync rebuilds a local follower's home feed after a backfill so older
   posts show up too.
-- Trending sources are public, unauthenticated endpoints of other servers.
-  Keep the interval reasonable.
+- All remote endpoints used are public and unauthenticated. Keep intervals
+  and limits reasonable.
 
 ## License
 
