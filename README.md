@@ -16,8 +16,8 @@ pf-sync fills those gaps without patching Pixelfed:
 | open a remote profile | fetches its newest 20 public media posts and its real follower/following/post counts (~15 s) |
 | scroll to the end of it | loads the next 20 older posts, continuing on the remote server where the last batch ended |
 | follow someone | does the same backfill and adds the posts to your home feed; re-syncs followed accounts every 6 h |
-| open a remote post | fetches its comments (commenters' avatars follow automatically) and the real like/repost/comment counts |
-| open "Liked by" / "Shared by" | imports who liked and shared it (Mastodon publishes both lists; Pixelfed only reveals one liker) |
+| open a remote post | fetches its comments and replies to comments (commenters' avatars follow automatically) and the real like/repost/comment counts |
+| open "Liked by" / "Shared by" | imports who liked and shared it. Mastodon publishes both lists; Pixelfed only reveals one liker, so on Pixelfed-hosted posts the rest stay unknown |
 | search for a name, e.g. `xkcd` | looks it up on mastodon.social and imports the most followed accounts whose handle starts with it; search again a few seconds later and they're listed, most followed first |
 | open the global timeline | finds trending posts from 7 Pixelfed servers with at least 10 likes, pulled in every 30 min (sensitive ones skipped). Backfilled posts stay out of it |
 | open Discover → Popular accounts | finds popular accounts from a daily crawl of public account directories |
@@ -51,6 +51,7 @@ log every 15 s instead.
 | profile opened | `GET /api/(pixelfed/)v1/accounts/<id>` |
 | profile scrolled | `GET /api/(pixelfed/)v1/accounts/<id>/statuses?…cursor=…` (or `max_id=`) |
 | post opened | `GET /api/(pixelfed/)v1/statuses/<id>[/context]` |
+| comments / replies opened, comment refresh | `GET /api/v2/statuses/<post or comment id>/replies` |
 | likes/shares list opened | `GET /api/v1/statuses/<id>/favourited_by` or `/reblogged_by` |
 | search | `GET /api/v2/search?q=…` |
 
@@ -59,8 +60,15 @@ Where remote data comes from:
   Pixelfed's ActivityPub outbox is intentionally empty, so this is the only way
   to list a Pixelfed account's posts. Then Mastodon's public account API
   (`only_media`, no replies, no boosts), then the ActivityPub outbox.
-- **Comments:** Mastodon's `/api/v1/statuses/{id}/context`, or Pixelfed's public
-  `/api/v2/comments/{account}/status/{id}`.
+- **Comments:** Mastodon's `/api/v1/statuses/{id}/context` (whole thread), or
+  Pixelfed's public `/api/v2/comments/{account}/status/{id}`, including replies
+  to comments (2 levels deep). Pixelfed lists comments that came from other
+  servers under its own URL, which can't be fetched. pf-sync finds the original
+  on the author's server by timestamp if that server has a Mastodon API.
+  Otherwise (Pixelfed hides comments from its public listing) it stores the
+  comment from the data given, the way Pixelfed stores remote text comments.
+  After each batch, pf-sync clears Pixelfed's replies cache (1 h, and the refresh
+  button only clears it every 5 min), so new comments show on the next load.
 - **Likers/sharers:** Mastodon's `/api/v1/statuses/{id}/favourited_by` and `/reblogged_by`.
   They are stored exactly as Pixelfed stores likes and shares it receives from
   other servers, without notifications or count changes.

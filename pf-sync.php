@@ -773,9 +773,159 @@ function scroll(Profile $p): void
 }
 
 /**
+ * Pixelfed's replies list for a post or comment is cached for an hour, and
+ * its refresh button only clears it every 5 minutes, so an early empty list
+ * would hide comments fetched afterwards.
+ */
+function bust_replies(array $ids): void
+{
+    foreach (array_unique(array_filter($ids)) as $id) {
+        Cache::forget('status:replies:all:'.$id);
+        Cache::forget('status:replies:all-rc:'.$id);
+        StatusService::del($id);
+    }
+}
+
+/**
+ * Collects a Pixelfed post's comments and replies to comments (2 levels deep)
+ * into $found, within $budget. Comments from other servers come back under
+ * the listing server's own URL, which nobody can fetch; they go to 'copies'.
+ * Returns the remote's top-level comment total.
+ */
+function pixelfed_comments(string $host, string $accountId, string $statusId, int &$budget, int $depth, array &$found): ?int
+{
+    $total = null;
+    $nested = [];
+    $url = "https://{$host}/api/v2/comments/{$accountId}/status/{$statusId}";
+    while ($url && $budget > 0) {
+        $page = http_json($url);
+        foreach ($page['data'] ?? [] as $r) {
+            if ($budget <= 0) {
+                break;
+            }
+            if (! is_string($r['uri'] ?? null)) {
+                continue;
+            }
+            // Comments of private accounts are listed but refused to
+            // anyone who isn't an approved follower.
+            if (! empty($r['account']['locked'])) {
+                $found['private']++;
+
+                continue;
+            }
+            $budget--;
+            if (($r['local'] ?? true) === false && parse_url($r['uri'], PHP_URL_HOST) === $host) {
+                $found['copies'][] = $r;
+
+                continue;
+            }
+            $found['items'][] = ['uri' => $r['uri'], 'counts' => api_counts($r)];
+            if (($r['reply_count'] ?? 0) > 0 && isset($r['account']['id'], $r['id'])) {
+                $nested[] = [(string) $r['account']['id'], (string) $r['id']];
+            }
+        }
+        $total ??= is_int($page['meta']['pagination']['total'] ?? null) ? $page['meta']['pagination']['total'] : null;
+        $url = $page['meta']['pagination']['links']['next'] ?? null;
+    }
+    if ($depth < 2) {
+        foreach ($nested as [$aid, $cid]) {
+            pixelfed_comments($host, $aid, $cid, $budget, $depth + 1, $found);
+        }
+    }
+
+    return $total;
+}
+
+/**
+ * Comments a Pixelfed server lists under its own (unfetchable) URL although
+ * they come from another server. For a Mastodon-API author the original is
+ * found on their server by its timestamp and fetched; otherwise (Pixelfed
+ * hides replies from its public listing) the comment is stored from the data
+ * given, the way Pixelfed stores remote text comments. Returns [fetched, stored].
+ */
+function add_comment_copies(array $comments, Status $post): array
+{
+    $authors = array_unique(array_filter(array_map(fn ($r) => $r['account']['url'] ?? null, $comments)));
+    parallel($authors, fn ($url) => Helpers::profileFetch($url));
+
+    $fetched = $stored = 0;
+    foreach ($comments as $r) {
+        if (stored_status($r['uri'])) {
+            continue;
+        }
+        $author = is_string($r['account']['url'] ?? null) ? Helpers::profileFetch($r['account']['url']) : null;
+        if (! $author || ! $author->domain) {
+            continue;
+        }
+        if (($original = find_original_comment($r, $author)) && ! stored_status($original)) {
+            try {
+                if (Helpers::statusFetch($original)) {
+                    $fetched++;
+
+                    continue;
+                }
+            } catch (Throwable) {
+            }
+        }
+        $parent = isset($r['in_reply_to_id']) && (string) $r['in_reply_to_id'] !== (string) post_remote_id($post)
+            ? null
+            : $post;
+        if (! $parent) {
+            continue;
+        }
+        $html = app(App\Services\SanitizeService::class)->html((string) ($r['content'] ?? ''));
+        Status::create([
+            'profile_id' => $author->id,
+            'uri' => $r['uri'],
+            'url' => $r['uri'],
+            'object_url' => $r['uri'],
+            'caption' => strip_tags($html),
+            'rendered' => $html,
+            'created_at' => Carbon\Carbon::parse($r['created_at'] ?? 'now')->tz('UTC'),
+            'in_reply_to_id' => $parent->id,
+            'in_reply_to_profile_id' => $parent->profile_id,
+            'local' => false,
+            'is_nsfw' => ! empty($r['sensitive']),
+            'cw_summary' => ($r['spoiler_text'] ?? '') !== '' ? strip_tags($r['spoiler_text']) : null,
+            'scope' => 'public',
+            'visibility' => 'public',
+            'type' => 'text',
+        ]);
+        $stored++;
+    }
+
+    return [$fetched, $stored];
+}
+
+/** The id a remote post has on its own server (last number in its URI). */
+function post_remote_id(Status $s): ?string
+{
+    return preg_match('#/(\d+)/?$#', (string) parse_url($s->uri ?? $s->object_url ?? '', PHP_URL_PATH), $m) ? $m[1] : null;
+}
+
+/** Finds a comment on its author's server by its exact time (Mastodon API servers). */
+function find_original_comment(array $r, Profile $author): ?string
+{
+    $rid = remote_account_id($author);
+    $when = substr((string) ($r['created_at'] ?? ''), 0, 19);
+    if (! $rid || $when === '') {
+        return null;
+    }
+    $list = http_json('https://'.remote_host($author)."/api/v1/accounts/{$rid}/statuses?exclude_reblogs=true&limit=40");
+    foreach (is_array($list) && array_is_list($list) ? $list : [] as $c) {
+        if (! empty($c['in_reply_to_id']) && substr((string) ($c['created_at'] ?? ''), 0, 19) === $when && is_string($c['uri'] ?? null)) {
+            return $c['uri'];
+        }
+    }
+
+    return null;
+}
+
+/**
  * A remote post was opened: fetch its comments (Mastodon: the reply thread,
- * Pixelfed: its public comments API) and refresh like/repost/comment counts.
- * Pixelfed fetches avatars of the comment authors itself.
+ * Pixelfed: its public comments API, including replies to comments) and
+ * refresh like/repost/comment counts. Pixelfed fetches the comment authors'
+ * avatars itself.
  */
 function open_post(int|string $id): void
 {
@@ -792,6 +942,7 @@ function open_post(int|string $id): void
     $rid = $m[1];
 
     $replies = [];
+    $copies = [];
     $counts = [];
     $private = 0;
     $remote = http_json("https://{$host}/api/v1/statuses/{$rid}");
@@ -810,24 +961,15 @@ function open_post(int|string $id): void
         if (is_array($one) && is_array($one[0] ?? null) && (string) ($one[0]['id'] ?? '') === $rid) {
             $counts = api_counts($one[0]);
         }
-        $url = "https://{$host}/api/v2/comments/{$arid}/status/{$rid}";
-        while ($url && count($replies) < POST_REPLIES_MAX) {
-            $page = http_json($url);
-            foreach ($page['data'] ?? [] as $r) {
-                // Comments of private Pixelfed accounts are listed but refused
-                // to anyone who isn't an approved follower.
-                if (! empty($r['account']['locked'])) {
-                    $private++;
-                } elseif (is_string($r['uri'] ?? null)) {
-                    $replies[] = ['uri' => $r['uri'], 'counts' => api_counts($r)];
-                }
-            }
-            $total = $page['meta']['pagination']['total'] ?? null;
-            if (is_int($total)) {
-                $counts['reply_count'] = $total;
-            }
-            $url = $page['meta']['pagination']['links']['next'] ?? null;
+        $budget = POST_REPLIES_MAX;
+        $found = ['items' => [], 'copies' => [], 'private' => 0];
+        $total = pixelfed_comments($host, $arid, $rid, $budget, 0, $found);
+        if ($total !== null) {
+            $counts['reply_count'] = $total;
         }
+        $replies = $found['items'];
+        $copies = $found['copies'];
+        $private = $found['private'];
     }
 
     // Counts first, then comments in batches in the order the remote lists
@@ -839,13 +981,24 @@ function open_post(int|string $id): void
         [$n, $f] = fetch_items(array_reverse($chunk), false);
         $new += $n;
         $failed += $f;
+        bust_replies([$s->id, ...array_map(fn ($i) => stored_status($i['uri'])?->in_reply_to_id, $chunk)]);
     }
+    [$recovered, $copied] = add_comment_copies($copies ?? [], $s);
+    $new += $recovered + $copied;
+    $failed += count($copies ?? []) - $recovered - $copied;
+    bust_replies([$s->id]);
     // Pixelfed's queue bumps reply_count for every fetched reply, partly after
-    // this returns, so the base is also re-applied by the next ticks.
+    // this returns, so the bases of the post and its comments are also
+    // re-applied by the next ticks.
     set_post_remote_counts($s->fresh(), $counts);
     if ($counts) {
         $pending = Cache::get(KEY.'pending-counts', []);
         $pending[(string) $s->id] = time() + PENDING_COUNTS_SECONDS;
+        foreach ($replies as $item) {
+            if ($item['counts'] && ($c = stored_status($item['uri']))) {
+                $pending[(string) $c->id] = time() + PENDING_COUNTS_SECONDS;
+            }
+        }
         Cache::forever(KEY.'pending-counts', $pending);
     } else {
         // Remote unreachable or rate limited: let the next open retry.
@@ -853,8 +1006,10 @@ function open_post(int|string $id): void
     }
 
     out(sprintf(
-        'post %s: %d comments listed, %d new, %d failed%s; counts %s',
-        $uri, count($replies), $new, $failed, $private ? ", {$private} from private accounts skipped" : '', json_encode($counts)
+        'post %s: %d comments listed%s, %d new, %d failed%s; counts %s',
+        $uri, count($replies) + count($copies),
+        $copies ? ' ('.count($copies).' from other servers: '.$recovered.' found, '.$copied.' copied)' : '',
+        $new, $failed, $private ? ", {$private} from private accounts skipped" : '', json_encode($counts)
     ));
 }
 

@@ -12,6 +12,7 @@
 #   open a profile     GET /api/(pixelfed/)v1/accounts/<id>
 #   scroll a profile   GET /api/(pixelfed/)v1/accounts/<id>/statuses?...cursor=|max_id=
 #   open a post        GET /api/(pixelfed/)v1/statuses/<id>[/context]
+#   comments/replies   GET /api/v2/statuses/<post or comment id>/replies
 #   liked/shared by    GET /api/v1/statuses/<id>/favourited_by|reblogged_by
 #   search             GET /api/v2/search?q=...
 set -euo pipefail
@@ -69,6 +70,8 @@ line_event() {
         echo "scroll:${BASH_REMATCH[2]}"
     elif [[ $path =~ ^/api/(pixelfed/)?v1/statuses/([0-9]+)(/context)?$ ]]; then
         echo "post:${BASH_REMATCH[2]}"
+    elif [[ $path =~ ^/api/v2/statuses/([0-9]+)/replies ]]; then
+        echo "post:${BASH_REMATCH[1]}"
     elif [[ $path =~ ^/api/v1/statuses/([0-9]+)/(favourited_by|reblogged_by) ]]; then
         echo "likers:${BASH_REMATCH[1]}"
     elif [[ $path =~ ^/api/v2/search\?(.*\&)?q=([^\&]+) ]]; then
