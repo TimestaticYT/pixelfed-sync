@@ -37,6 +37,7 @@ $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
 
 use App\Models\Follower;
 use App\Models\FollowRequest;
+use App\Models\Like;
 use App\Models\Profile;
 use App\Models\Status;
 use App\Services\AccountService;
@@ -98,6 +99,8 @@ const MAX_BACKFILLS_PER_TICK = 5;       // keeps one tick short
 const MAX_SEARCHES_PER_TICK = 3;
 const SEARCH_COOLDOWN = 3600;           // per query
 const PENDING_COUNTS_SECONDS = 300;
+const DELIVERY_GRACE = 30;              // seconds a local like/follow may take to reach the remote server
+const POST_BASE_TTL = 90 * 86400;
 const MAX_COUNT_FETCHES_PER_TICK = 10;
 const COUNTS_TTL = 12 * 3600;           // how long remote profile counts are trusted
 const TRACK_DAYS = 30;                  // keep showing counts for opened profiles this long
@@ -296,11 +299,93 @@ function outbox_page(Profile $p, ?string $pageUrl, int $limit): array
     return [array_slice($items, 0, $limit), $next ? ['kind' => 'outbox', 'next' => $next] : null];
 }
 
-/**
- * Writes remote like/repost/comment counts onto a stored post. Pixelfed only
- * counts what reached this server, so these would otherwise stay near 0.
+/*
+ * Counts shown = remote count + what this server's own users did since it was
+ * fetched. Likes, reposts, comments and follows by local users are federated,
+ * so the next remote fetch already includes them; until then (and after an
+ * unlike or unfollow) the local difference keeps the number honest. Each fetch
+ * stores a "base": the remote numbers plus the local numbers at that moment,
+ * minus DELIVERY_GRACE so actions still in flight count as local.
  */
-function apply_post_counts(Status $s, array $counts): bool
+
+/** Profile ids of this server's users. */
+function local_ids(): array
+{
+    static $ids;
+
+    return $ids ??= Profile::whereNull('domain')->whereNotNull('user_id')->pluck('id')->all();
+}
+
+function created_before(mixed $query, mixed $before): mixed
+{
+    return $before ? $query->where('created_at', '<', $before) : $query;
+}
+
+/** Likes, reposts and comments this server's users gave a post. */
+function local_post_counts(int|string $id, mixed $before = null): array
+{
+    return [
+        'likes_count' => created_before(Like::where('status_id', $id)->whereIn('profile_id', local_ids()), $before)->count(),
+        'reblogs_count' => created_before(Status::where('reblog_of_id', $id)->whereIn('profile_id', local_ids()), $before)->count(),
+        'reply_count' => created_before(Status::where('in_reply_to_id', $id)->whereIn('profile_id', local_ids()), $before)->count(),
+    ];
+}
+
+/** Follows between this server's users and a remote account. */
+function local_follow_counts(Profile $p, mixed $before = null): array
+{
+    return [
+        'followers_count' => created_before(Follower::where('following_id', $p->id)->whereIn('profile_id', local_ids()), $before)->count(),
+        'following_count' => created_before(Follower::where('profile_id', $p->id)->whereIn('following_id', local_ids()), $before)->count(),
+        'status_count' => 0,
+    ];
+}
+
+/** Stores freshly fetched remote numbers with the local numbers at this moment. */
+function new_base(?array $base, array $remote, array $localThen): array
+{
+    $base = is_array($base) && isset($base['r']) ? $base : ['r' => [], 'l0' => []];
+    foreach ($remote as $field => $value) {
+        $base['r'][$field] = $value;
+        $base['l0'][$field] = $localThen[$field] ?? 0;
+    }
+    $base['at'] = time();
+
+    return $base;
+}
+
+function wanted_counts(array $base, array $localNow): array
+{
+    $want = [];
+    foreach ($base['r'] as $field => $value) {
+        $want[$field] = max(0, $value + ($localNow[$field] ?? 0) - ($base['l0'][$field] ?? 0));
+    }
+
+    return $want;
+}
+
+function set_post_remote_counts(Status $s, array $remote): void
+{
+    if (! $remote) {
+        return;
+    }
+    $key = KEY.'pb:'.$s->id;
+    $base = new_base(Cache::get($key), $remote, local_post_counts($s->id, now()->subSeconds(DELIVERY_GRACE)));
+    Cache::put($key, $base, POST_BASE_TTL);
+    write_post_counts($s, wanted_counts($base, local_post_counts($s->id)));
+}
+
+/** Re-applies a post's stored base against current local activity. */
+function apply_post_base(Status $s): bool
+{
+    $base = Cache::get(KEY.'pb:'.$s->id);
+
+    return is_array($base) && isset($base['r'])
+        && write_post_counts($s, wanted_counts($base, local_post_counts($s->id)));
+}
+
+/** Writes like/repost/comment counts onto a stored post and busts its cache. */
+function write_post_counts(Status $s, array $counts): bool
 {
     $changes = [];
     foreach ($counts as $field => $value) {
@@ -339,11 +424,11 @@ function fetch_items(array $items): array
             continue;
         }
         if ($item['counts']) {
-            apply_post_counts($s, $item['counts']);
+            set_post_remote_counts($s, $item['counts']);
         }
         // Real author counts make them rank properly in search and Discover.
         if (! empty($item['author']) && ($author = remote_profile($s->profile_id))) {
-            apply_counts($author, $item['author']);
+            set_profile_remote_counts($author, $item['author']);
         }
     }
 
@@ -376,7 +461,7 @@ function import_account(array $a, bool $fromDirectory): string
     if (! $p || ! $p->domain) {
         return 'failed';
     }
-    apply_counts($p, account_counts($a));
+    set_profile_remote_counts($p, account_counts($a));
 
     return $status;
 }
@@ -456,38 +541,63 @@ function lookup_search(string $q): void
     }
 }
 
-/** Remote follower/following/post counts from the actor's collections, cached. */
-function remote_counts(Profile $p, bool $refresh = false): ?array
+/**
+ * A profile's count base, refetched from the actor's collections when missing
+ * or older than COUNTS_TTL (or when $refresh). Returns null if never fetched.
+ */
+function profile_base(Profile $p, bool $refresh = false): ?array
 {
-    $key = KEY.'counts:'.$p->id;
-    if (! $refresh && is_array($cached = Cache::get($key))) {
-        return $cached;
+    $base = Cache::get(KEY.'pc:'.$p->id);
+    if (! $refresh && is_array($base) && $base['at'] > time() - COUNTS_TTL) {
+        return $base;
     }
     $actor = ap_json($p->remote_url);
     if (! $actor) {
-        return null;
+        return is_array($base) ? $base : null;
     }
     $total = function ($url) {
         $c = is_string($url) ? ap_json($url) : (is_array($url) ? $url : null);
 
         return is_int($c['totalItems'] ?? null) ? $c['totalItems'] : null;
     };
-    $counts = array_filter([
+    $remote = array_filter([
         'followers_count' => $total($actor['followers'] ?? null),
         'following_count' => $total($actor['following'] ?? null),
         'status_count' => $total($actor['outbox'] ?? null),
     ], fn ($v) => $v !== null);
-    Cache::put($key, $counts, COUNTS_TTL);
 
-    return $counts;
+    return set_profile_remote_counts($p, $remote, false);
+}
+
+function set_profile_remote_counts(Profile $p, array $remote, bool $write = true): ?array
+{
+    if (! $remote) {
+        return Cache::get(KEY.'pc:'.$p->id);
+    }
+    $key = KEY.'pc:'.$p->id;
+    $base = new_base(Cache::get($key), $remote, local_follow_counts($p, now()->subSeconds(DELIVERY_GRACE)));
+    Cache::put($key, $base, TRACK_DAYS * 86400);
+    if ($write) {
+        apply_profile_base($p, $base);
+    }
+
+    return $base;
 }
 
 /**
- * Writes the remote counts onto the local profile. Pixelfed itself never reads
- * them and periodically resets status_count to the locally stored posts, so this
- * is re-applied on every tick for tracked profiles.
+ * Applies a profile's base against current local follows. Pixelfed never reads
+ * remote counts, resets status_count to the locally stored posts and, on some
+ * unfollows, followers/following to local follows only, so this is re-applied
+ * on every tick for tracked profiles.
  */
-function apply_counts(Profile $p, ?array $counts): bool
+function apply_profile_base(Profile $p, ?array $base): bool
+{
+    return is_array($base) && isset($base['r'])
+        && write_profile_counts($p, wanted_counts($base, local_follow_counts($p)));
+}
+
+/** Writes follower/following/post counts onto a remote profile and busts its cache. */
+function write_profile_counts(Profile $p, array $counts): bool
 {
     $changes = [];
     foreach ($counts ?? [] as $field => $value) {
@@ -529,8 +639,9 @@ function backfill(Profile $p, string $why): void
     if ($why !== 'followed' || ! Cache::has(KEY.'cursor:'.$p->id)) {
         save_cursor($p, $next);
     }
-    $counts = remote_counts($p, true);
-    apply_counts($p->fresh(), $counts);
+    $base = profile_base($p, true);
+    apply_profile_base($p->fresh(), $base);
+    $counts = $base['r'] ?? null;
     Cache::put(KEY.'backfilled:'.$p->id, time(), RESYNC_SECONDS);
     if ($new > 0) {
         rebuild_follower_feeds($p);
@@ -637,11 +748,11 @@ function open_post(int|string $id): void
     $replies = array_slice($replies, 0, POST_REPLIES_MAX);
     [$new, $failed] = fetch_items(array_reverse($replies));
     // Pixelfed's queue bumps reply_count for every fetched reply, partly after
-    // this returns, so the counts are also re-applied by the next ticks.
-    apply_post_counts($s->fresh(), $counts);
+    // this returns, so the base is also re-applied by the next ticks.
+    set_post_remote_counts($s->fresh(), $counts);
     if ($counts) {
         $pending = Cache::get(KEY.'pending-counts', []);
-        $pending[(string) $s->id] = ['counts' => $counts, 'until' => time() + PENDING_COUNTS_SECONDS];
+        $pending[(string) $s->id] = time() + PENDING_COUNTS_SECONDS;
         Cache::forever(KEY.'pending-counts', $pending);
     }
 
@@ -714,21 +825,24 @@ function cmd_tick(array $events): void
 
             continue;
         }
-        $cached = Cache::has(KEY.'counts:'.$id);
-        if (! $cached && $fetches++ >= MAX_COUNT_FETCHES_PER_TICK) {
-            continue;
-        }
-        if (apply_counts($p, remote_counts($p)) && ! $cached) {
-            out("counts {$p->username}: ".json_encode(remote_counts($p)));
+        $base = Cache::get(KEY.'pc:'.$id);
+        $stale = ! is_array($base) || ($base['at'] ?? 0) <= $now - COUNTS_TTL;
+        if ($stale && $fetches++ < MAX_COUNT_FETCHES_PER_TICK) {
+            $base = profile_base($p, true);
+            if (apply_profile_base($p, $base)) {
+                out("counts {$p->username}: ".json_encode($base['r'] ?? null));
+            }
+        } else {
+            apply_profile_base($p, $base);
         }
     }
 
     Cache::forever(KEY.'tracked', $tracked);
 
-    $pending = array_filter(Cache::get(KEY.'pending-counts', []), fn ($p) => $p['until'] > $now);
-    foreach ($pending as $id => $p) {
+    $pending = array_filter(Cache::get(KEY.'pending-counts', []), fn ($until) => is_int($until) && $until > $now);
+    foreach (array_keys($pending) as $id) {
         if ($s = Status::find($id)) {
-            apply_post_counts($s, $p['counts']);
+            apply_post_base($s);
         }
     }
     Cache::forever(KEY.'pending-counts', $pending);

@@ -55,8 +55,25 @@ Where remote data comes from:
 - **Comments:** Mastodon's `/api/v1/statuses/{id}/context`, or Pixelfed's public
   `/api/v2/comments/{account}/status/{id}`.
 - **Counts:** the remote APIs, or the actor's ActivityPub collections for profiles.
-  Pixelfed resets some counts to what it has stored locally, so pf-sync
-  re-applies them.
+
+### How remote and local numbers combine
+
+Your likes, reposts, comments and follows are federated as usual. The other
+server receives them and counts them, so they show up there too. pf-sync shows:
+
+> **remote count + what users on this server did since that count was fetched**
+
+At every fetch it stores the remote numbers together with this server's own
+likes/reposts/comments (or follows) at that moment. Afterwards it adds the
+difference. So your like counts immediately, and an unlike or unfollow takes it
+away immediately. Once the next fetch already includes your action, the
+difference is 0 again, so nothing is counted twice. Actions from the last 30 s
+before a fetch count as local, because they may not have arrived remotely yet.
+
+Pixelfed itself adds +1/−1 for local likes, reposts and comments, but on some
+unfollows it resets a remote account to "followers on this server only", and
+it periodically resets post counts. pf-sync re-applies the combined numbers
+for tracked accounts and recently opened posts.
 - **Accounts:** Mastodon's public `/api/v1/directory` and `/api/v2/search`.
   Pixelfed's own search and Popular accounts both rank by follower count, so
   the real counts put popular accounts first.
