@@ -15,7 +15,8 @@
  *
  *   docker exec -i -u www-data <web-container> php -- tick [open:ID scroll:ID post:ID ...] < pf-sync.php
  *
- * Commands: tick [...] | trending [--force] | backfill <id|@user@domain> | post <id> | status
+ * Commands: tick [...] | events [...] | trending [--force] | index [--force] | backfill <id|@user@domain>
+ *           | post <id> | likers <id> | search <name> | clean-global | status
  *
  * Settings are PF_SYNC_* environment variables (see README / pf-sync.env).
  * Only public posts can be fetched: remote servers serve nothing else without
@@ -47,6 +48,7 @@ use App\Services\NetworkTimelineService;
 use App\Services\StatusService;
 use App\Util\ActivityPub\Helpers;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 
 /** Reads PF_SYNC_<key>, typed after its default. */
@@ -71,7 +73,8 @@ define('SCROLL_BATCH', cfg('SCROLL_BATCH', 20));
 define('SCROLL_MAX_POSTS', cfg('SCROLL_MAX_POSTS', 240));
 define('POST_DETAILS', cfg('POST_DETAILS', true));
 define('POST_REPLIES_MAX', cfg('POST_REPLIES_MAX', 40));
-define('POST_COOLDOWN', cfg('POST_COOLDOWN_MINUTES', 10) * 60);
+define('POST_COOLDOWN', cfg('POST_COOLDOWN_MINUTES', 2) * 60);
+define('PARALLEL', max(1, cfg('PARALLEL', 4)));
 define('TRENDING', cfg('TRENDING', true));
 define('TRENDING_INTERVAL', cfg('TRENDING_INTERVAL_MINUTES', 30) * 60);
 define('TRENDING_MAX_PER_RUN', cfg('TRENDING_MAX_PER_RUN', 80));
@@ -413,25 +416,82 @@ function write_post_counts(Status $s, array $counts): bool
     return true;
 }
 
+/** Closes database and Redis connections; they reopen on next use. */
+function disconnect_all(): void
+{
+    foreach (array_keys(DB::getConnections()) as $name) {
+        DB::disconnect($name);
+    }
+    $redis = app('redis');
+    foreach (array_keys($redis->connections() ?? []) as $name) {
+        $redis->purge($name);
+    }
+}
+
 /**
- * Fetches items through Pixelfed, oldest first so feed order stays right,
- * then applies their counts (to already stored posts too). Pixelfed adds new
- * public posts to the global timeline; with $global false they're taken out
- * again. Returns [new, failed].
+ * Runs $fn for every item in up to PARALLEL forked workers, so one slow or
+ * dead remote server (Pixelfed waits up to 15 s per request) only holds up
+ * its own worker. Connections are closed first so each worker opens its own.
+ */
+function parallel(array $items, callable $fn): void
+{
+    $items = array_values($items);
+    $workers = min(PARALLEL, count($items));
+    if ($workers <= 1 || ! function_exists('pcntl_fork')) {
+        foreach ($items as $item) {
+            try {
+                $fn($item);
+            } catch (Throwable) {
+            }
+        }
+
+        return;
+    }
+
+    disconnect_all();
+    $pids = [];
+    for ($w = 0; $w < $workers; $w++) {
+        $pid = pcntl_fork();
+        if ($pid === 0) {
+            for ($i = $w; $i < count($items); $i += $workers) {
+                try {
+                    $fn($items[$i]);
+                } catch (Throwable) {
+                }
+            }
+            disconnect_all();
+            exit(0);
+        }
+        if ($pid > 0) {
+            $pids[] = $pid;
+        } else {
+            // Fork failed: do this worker's share here.
+            for ($i = $w; $i < count($items); $i += $workers) {
+                try {
+                    $fn($items[$i]);
+                } catch (Throwable) {
+                }
+            }
+        }
+    }
+    foreach ($pids as $pid) {
+        pcntl_waitpid($pid, $status);
+    }
+}
+
+/**
+ * Fetches items through Pixelfed in parallel, then applies their counts (to
+ * already stored posts too). Pixelfed adds new public posts to the global
+ * timeline; with $global false they're taken out again. Returns [new, failed].
  */
 function fetch_items(array $items, bool $global): array
 {
+    $todo = array_values(array_filter(array_reverse($items), fn ($i) => ! stored_status($i['uri'])));
+    parallel($todo, fn ($item) => Helpers::statusFetch($item['uri']));
+
     $new = $failed = 0;
-    foreach (array_reverse($items) as $item) {
-        if (stored_status($item['uri'])) {
-            continue;
-        }
-        try {
-            $status = Helpers::statusFetch($item['uri']);
-        } catch (Throwable) {
-            $status = null;
-        }
-        if (! $status) {
+    foreach ($todo as $item) {
+        if (! ($status = stored_status($item['uri']))) {
             $failed++;
 
             continue;
@@ -733,6 +793,7 @@ function open_post(int|string $id): void
 
     $replies = [];
     $counts = [];
+    $private = 0;
     $remote = http_json("https://{$host}/api/v1/statuses/{$rid}");
     if (is_array($remote) && isset($remote['id'])) {
         $counts = api_counts($remote);
@@ -753,7 +814,11 @@ function open_post(int|string $id): void
         while ($url && count($replies) < POST_REPLIES_MAX) {
             $page = http_json($url);
             foreach ($page['data'] ?? [] as $r) {
-                if (is_string($r['uri'] ?? null)) {
+                // Comments of private Pixelfed accounts are listed but refused
+                // to anyone who isn't an approved follower.
+                if (! empty($r['account']['locked'])) {
+                    $private++;
+                } elseif (is_string($r['uri'] ?? null)) {
                     $replies[] = ['uri' => $r['uri'], 'counts' => api_counts($r)];
                 }
             }
@@ -765,10 +830,16 @@ function open_post(int|string $id): void
         }
     }
 
-    // fetch_items works back to front; reversing first keeps Mastodon's
-    // parent-before-child thread order.
+    // Counts first, then comments in batches in the order the remote lists
+    // them, so a reload shows the first ones after a few seconds.
+    set_post_remote_counts($s->fresh(), $counts);
     $replies = array_slice($replies, 0, POST_REPLIES_MAX);
-    [$new, $failed] = fetch_items(array_reverse($replies), false);
+    $new = $failed = 0;
+    foreach (array_chunk($replies, PARALLEL * 2) as $chunk) {
+        [$n, $f] = fetch_items(array_reverse($chunk), false);
+        $new += $n;
+        $failed += $f;
+    }
     // Pixelfed's queue bumps reply_count for every fetched reply, partly after
     // this returns, so the base is also re-applied by the next ticks.
     set_post_remote_counts($s->fresh(), $counts);
@@ -781,7 +852,10 @@ function open_post(int|string $id): void
         Cache::forget(KEY.'post:'.$id);
     }
 
-    out(sprintf('post %s: %d comments listed, %d new, %d failed; counts %s', $uri, count($replies), $new, $failed, json_encode($counts)));
+    out(sprintf(
+        'post %s: %d comments listed, %d new, %d failed%s; counts %s',
+        $uri, count($replies), $new, $failed, $private ? ", {$private} from private accounts skipped" : '', json_encode($counts)
+    ));
 }
 
 /**
@@ -807,11 +881,13 @@ function open_likers(int|string $id): void
     $likers = http_json("https://{$host}/api/v1/statuses/{$rid}/favourited_by?limit=".min(LIKERS_MAX, 80));
     $sharers = http_json("https://{$host}/api/v1/statuses/{$rid}/reblogged_by?limit=".min(LIKERS_MAX, 80));
     if (! is_array($likers) && ($arid = remote_account_id($author))) {
+        // Pixelfed names one liker by its id on that server, which may be an
+        // account from yet another server: resolve id -> handle -> actor.
         $one = http_json(api_url(['kind' => 'pixelfed', 'host' => $host, 'rid' => $arid, 'max_id' => (string) ((int) $rid + 1)], 1));
         $by = $one[0]['liked_by'] ?? null;
-        $likers = is_array($by) && is_string($by['username'] ?? null)
-            ? [['uri' => "https://{$host}/users/{$by['username']}"]]
-            : null;
+        $acct = is_array($by) && isset($by['id']) ? (http_json("https://{$host}/api/pixelfed/v1/accounts/{$by['id']}")['acct'] ?? null) : null;
+        $actor = is_string($acct) ? webfinger_actor(str_contains($acct, '@') ? $acct : "{$acct}@{$host}") : null;
+        $likers = $actor ? [['uri' => $actor]] : null;
     }
     if (! is_array($likers) && ! is_array($sharers)) {
         Cache::forget(KEY.'likers:'.$id);
@@ -819,10 +895,22 @@ function open_likers(int|string $id): void
         return;
     }
 
+    $lists = [
+        'likes' => array_slice(array_filter(is_array($likers) ? $likers : [], 'is_array'), 0, LIKERS_MAX),
+        'shares' => array_slice(array_filter(is_array($sharers) ? $sharers : [], 'is_array'), 0, LIKERS_MAX),
+    ];
+    $unique = [];
+    foreach ([...$lists['likes'], ...$lists['shares']] as $a) {
+        if (is_string($a['uri'] ?? null)) {
+            $unique[$a['uri']] = $a;
+        }
+    }
+    parallel($unique, fn ($a) => import_account($a, false));
+
     $tally = ['likes' => 0, 'shares' => 0, 'failed' => 0];
-    foreach ([['likes', $likers], ['shares', $sharers]] as [$kind, $accounts]) {
-        foreach (array_slice(is_array($accounts) ? $accounts : [], 0, LIKERS_MAX) as $a) {
-            if (! is_array($a) || import_account($a, false) === 'skipped'
+    foreach ($lists as $kind => $accounts) {
+        foreach ($accounts as $a) {
+            if (! is_string($a['uri'] ?? null)
                 || ! ($p = Profile::where('remote_url', $a['uri'])->whereNotNull('domain')->first())) {
                 $tally['failed']++;
 
@@ -848,6 +936,23 @@ function open_likers(int|string $id): void
     ));
 }
 
+/** Actor URI for user@host via webfinger. */
+function webfinger_actor(string $acct): ?string
+{
+    [$user, $host] = array_pad(explode('@', ltrim($acct, '@'), 2), 2, null);
+    if (! $user || ! $host) {
+        return null;
+    }
+    $wf = http_json("https://{$host}/.well-known/webfinger?resource=acct:".rawurlencode($user)."@{$host}");
+    foreach ($wf['links'] ?? [] as $link) {
+        if (($link['rel'] ?? null) === 'self' && is_string($link['href'] ?? null)) {
+            return $link['href'];
+        }
+    }
+
+    return null;
+}
+
 function remote_profile(int|string $id): ?Profile
 {
     $p = Profile::whereKey($id)->whereNotNull('domain')->first();
@@ -866,14 +971,31 @@ function followed_remote_ids(): array
     return Profile::whereIn('id', $ids)->whereNotNull('domain')->pluck('id')->map(fn ($v) => (string) $v)->all();
 }
 
-/** @param array<string, list<string>> $events open/scroll/post => ids */
-function cmd_tick(array $events): void
+/**
+ * Marks profiles as tracked (their counts are kept applied for TRACK_DAYS).
+ * Re-reads right before writing because several event handlers may run at once.
+ */
+function track(array $ids): void
 {
-    $now = time();
-    $tracked = array_filter(Cache::get(KEY.'tracked', []), fn ($ts) => $ts > $now - TRACK_DAYS * 86400);
-    $followed = followed_remote_ids();
+    if (! $ids) {
+        return;
+    }
+    $tracked = Cache::get(KEY.'tracked', []);
+    foreach ($ids as $id) {
+        $tracked[(string) $id] = time();
+    }
+    Cache::forever(KEY.'tracked', $tracked);
+}
 
-    // Things someone is looking at right now go first.
+/**
+ * Handles what someone just did (search, opened post/likers, scrolled or
+ * opened profile). The live watcher calls this per event ("events" command);
+ * cron's "tick" also does the periodic work.
+ *
+ * @param array<string, list<string>> $events
+ */
+function cmd_tick(array $events, bool $periodic): void
+{
     foreach (final_queries($events['search']) as $q) {
         lookup_search($q);
     }
@@ -883,37 +1005,48 @@ function cmd_tick(array $events): void
     foreach (array_unique($events['likers']) as $id) {
         open_likers($id);
     }
-    foreach (array_filter(array_map('remote_profile', array_unique($events['scroll']))) as $p) {
-        $tracked[(string) $p->id] = $now;
+    $scrolled = array_filter(array_map('remote_profile', array_unique($events['scroll'])));
+    track(array_map(fn ($p) => $p->id, $scrolled));
+    foreach ($scrolled as $p) {
         scroll($p);
     }
-
     $opened = array_filter(array_map('remote_profile', array_unique($events['open'])));
-    $queue = [];
+    track(array_map(fn ($p) => $p->id, $opened));
     foreach ($opened as $p) {
-        $tracked[(string) $p->id] = $now;
-        $queue[(string) $p->id] = 'opened';
+        if (! Cache::has(KEY.'backfilled:'.$p->id)) {
+            backfill($p, 'opened');
+        }
     }
-    foreach ($followed as $id) {
-        $tracked[$id] = $now;
-        $queue[$id] ??= 'followed';
+
+    if ($periodic) {
+        periodic_work();
     }
+}
+
+/** Follow re-syncs, keeping counts applied, and post count re-application. */
+function periodic_work(): void
+{
+    $now = time();
+    $followed = followed_remote_ids();
+    track($followed);
     $done = 0;
-    foreach ($queue as $id => $why) {
+    foreach ($followed as $id) {
         if ($done >= MAX_BACKFILLS_PER_TICK) {
             break;
         }
         if (Cache::has(KEY.'backfilled:'.$id) || ! ($p = remote_profile($id))) {
             continue;
         }
-        backfill($p, $why);
+        backfill($p, 'followed');
         $done++;
     }
 
+    $tracked = Cache::get(KEY.'tracked', []);
+    $drop = array_keys(array_filter($tracked, fn ($ts) => $ts <= $now - TRACK_DAYS * 86400));
     $fetches = 0;
-    foreach (array_keys($tracked) as $id) {
+    foreach (array_diff(array_keys($tracked), $drop) as $id) {
         if (! ($p = remote_profile($id))) {
-            unset($tracked[$id]);
+            $drop[] = $id;
 
             continue;
         }
@@ -929,7 +1062,13 @@ function cmd_tick(array $events): void
         }
     }
 
-    Cache::forever(KEY.'tracked', $tracked);
+    if ($drop) {
+        $current = Cache::get(KEY.'tracked', []);
+        foreach ($drop as $id) {
+            unset($current[(string) $id]);
+        }
+        Cache::forever(KEY.'tracked', $current);
+    }
 
     $pending = array_filter(Cache::get(KEY.'pending-counts', []), fn ($until) => is_int($until) && $until > $now);
     foreach (array_keys($pending) as $id) {
@@ -1124,7 +1263,8 @@ function final_queries(array $queries): array
 $args = array_slice($argv, 1);
 $cmd = array_shift($args) ?? 'status';
 match ($cmd) {
-    'tick' => cmd_tick(parse_events($args)),
+    'tick' => cmd_tick(parse_events($args), true),
+    'events' => cmd_tick(parse_events($args), false),
     'trending' => cmd_trending(in_array('--force', $args, true)),
     'index' => cmd_index(in_array('--force', $args, true)),
     'search' => isset($args[0]) ? cmd_search(implode(' ', $args)) : out('usage: search <name>'),

@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Called by cron:
-#   * * * * *     run.sh            four ticks 15 s apart, so whatever someone
-#                                   just opened, scrolled or searched is handled
-#                                   within ~15 s
+#   * * * * *     run.sh watch      live watcher: reacts to the web log within ~1 s
+#                                   (starts it if it isn't running, else exits)
+#   * * * * *     run.sh            periodic work four times a minute; also handles
+#                                   events itself if the watcher isn't running
 #   */30 * * * *  run.sh trending   trending posts (slow, so it has its own lock)
 #   17 * * * *    run.sh index      account directory crawl (runs once a day)
 #
-# Events come from the web container's access log; the web UI and apps request:
+# Events come from the web container's access log (successful requests only);
+# the web UI and apps request:
 #   open a profile     GET /api/(pixelfed/)v1/accounts/<id>
 #   scroll a profile   GET /api/(pixelfed/)v1/accounts/<id>/statuses?...cursor=|max_id=
 #   open a post        GET /api/(pixelfed/)v1/statuses/<id>[/context]
@@ -20,6 +22,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE="$DIR/state"
 LOG="$DIR/logs/sync.log"
 MODE="${1:-tick}"
+MAX_JOBS="${PF_SYNC_WATCH_JOBS:-4}"
 mkdir -p "$STATE" "$DIR/logs"
 
 exec 9>"$STATE/$MODE.lock"
@@ -54,35 +57,83 @@ pf_sync() {
         | grep -v -e DEPRECATED -e '^\s*$' || true
 }
 
+# Prints the event for one access log line (open:ID, scroll:ID, post:ID,
+# likers:ID, search:QUERY), or nothing.
+line_event() {
+    local re='"GET (/api/[^ ]+) HTTP/[0-9.]+" 200 '
+    [[ $1 =~ $re ]] || return 0
+    local path=${BASH_REMATCH[1]}
+    if [[ $path =~ ^/api/(pixelfed/)?v1/accounts/([0-9]+)$ ]]; then
+        echo "open:${BASH_REMATCH[2]}"
+    elif [[ $path =~ ^/api/(pixelfed/)?v1/accounts/([0-9]+)/statuses\?.*(cursor|max_id)= ]]; then
+        echo "scroll:${BASH_REMATCH[2]}"
+    elif [[ $path =~ ^/api/(pixelfed/)?v1/statuses/([0-9]+)(/context)?$ ]]; then
+        echo "post:${BASH_REMATCH[2]}"
+    elif [[ $path =~ ^/api/v1/statuses/([0-9]+)/(favourited_by|reblogged_by) ]]; then
+        echo "likers:${BASH_REMATCH[1]}"
+    elif [[ $path =~ ^/api/v2/search\?(.*\&)?q=([^\&]+) ]]; then
+        echo "search:${BASH_REMATCH[2]}"
+    fi
+}
+
 docker inspect -f '{{.State.Running}}' "$WEB" 2>/dev/null | grep -q true || exit 0
 
-if [ "$MODE" = trending ] || [ "$MODE" = index ]; then
+case "$MODE" in
+trending | index)
     pf_sync "$MODE"
     exit 0
-fi
+    ;;
+watch)
+    # Each event runs in its own process (at most MAX_JOBS at once), so what
+    # someone is looking at never waits for other work. Searches wait for 2 s
+    # of quiet so typing "x", "xk", "xkc", "xkcd" becomes one lookup.
+    echo "$(date -u +%FT%TZ) watcher started for $WEB"
+    run_event() {
+        while [ "$(jobs -rp | wc -l)" -ge "$MAX_JOBS" ]; do
+            wait -n || true
+        done
+        pf_sync events "$1" &
+    }
+    search="" search_at=0
+    while IFS= read -r -t 1 line || [ $? -gt 128 ]; do
+        if [ -n "${line:-}" ]; then
+            event=$(line_event "$line")
+            case "$event" in
+            "") ;;
+            search:*) search="$event" search_at=$SECONDS ;;
+            *) run_event "$event" ;;
+            esac
+            line=""
+        fi
+        if [ -n "$search" ] && [ $((SECONDS - search_at)) -ge 2 ]; then
+            run_event "$search"
+            search=""
+        fi
+    done < <(docker logs -f --since 0s "$WEB" 2>&1)
+    wait
+    echo "$(date -u +%FT%TZ) watcher stopped (container restarted?), cron restarts it"
+    exit 0
+    ;;
+esac
+
+# tick: if the watcher runs, it handles events and this only does periodic work.
+watching=false
+flock -n "$STATE/watch.lock" true || watching=true
 
 for i in 1 2 3 4; do
     start=$(date +%s)
     now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     since=$(cat "$STATE/log-since" 2>/dev/null || date -u -d '-1 min' +%Y-%m-%dT%H:%M:%SZ)
-
-    # Only successful requests: logged-out visitors get 401/403 on these.
-    requests=$(docker logs --since "$since" --until "$now" "$WEB" 2>&1 \
-        | grep -oE '"GET /api/[^ ]+ HTTP/[0-9.]+" 200' | sed -E 's/^"GET //; s/ HTTP.*$//' || true)
     echo "$now" > "$STATE/log-since"
 
-    mapfile -t events < <(
-        {
-            grep -E '^/api/(pixelfed/)?v1/accounts/[0-9]+$' <<<"$requests" | sed -E 's#.*/##; s#^#open:#' || true
-            grep -E '^/api/(pixelfed/)?v1/accounts/[0-9]+/statuses\?.*(cursor|max_id)=' <<<"$requests" \
-                | sed -E 's#^.*/accounts/([0-9]+)/.*#scroll:\1#' || true
-            grep -E '^/api/(pixelfed/)?v1/statuses/[0-9]+(/context)?$' <<<"$requests" \
-                | sed -E 's#^.*/statuses/([0-9]+).*#post:\1#' || true
-            grep -E '^/api/v1/statuses/[0-9]+/(favourited_by|reblogged_by)' <<<"$requests" \
-                | sed -E 's#^.*/statuses/([0-9]+)/.*#likers:\1#' || true
-            grep -E '^/api/v2/search\?' <<<"$requests" | grep -oE '[?&]q=[^&]+' | sed -E 's#^.q=#search:#' || true
-        } | sort -u
-    )
+    events=()
+    if [ "$watching" = false ]; then
+        while IFS= read -r line; do
+            event=$(line_event "$line")
+            [ -n "$event" ] && events+=("$event")
+        done < <(docker logs --since "$since" --until "$now" "$WEB" 2>&1)
+        mapfile -t events < <(printf '%s\n' "${events[@]}" | sort -u | grep -v '^$' || true)
+    fi
 
     pf_sync tick "${events[@]}"
 

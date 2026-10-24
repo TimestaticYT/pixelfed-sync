@@ -36,10 +36,15 @@ timeline services). So storage, avatars, the network timeline and home feeds
 behave as if everything had federated normally. It's piped in on stdin, so
 nothing is mounted or patched, and Pixelfed upgrades leave it alone.
 
-`run.sh` is the cron entry point. It reads what people do from the
-container's access log, using the requests the web UI and apps make anyway.
-Only successful (HTTP 200) requests count, so logged-out visitors can't
-trigger fetches.
+`run.sh watch` streams the container's access log and reacts to what people
+do within about a second, using the requests the web UI and apps make anyway.
+Each event runs in its own process (4 at a time), so what someone is looking at
+never waits for background work. Searches wait for 2 s of typing quiet. Only
+successful (HTTP 200) requests count, so logged-out visitors can't trigger
+fetches. Remote posts, comments and accounts are fetched by 4 parallel workers,
+so a slow or dead remote server (Pixelfed waits up to 15 s) only holds up its
+own worker. If the watcher isn't running, the per-minute cron job reads the
+log every 15 s instead.
 
 | Event | Request |
 |---|---|
@@ -105,13 +110,15 @@ crontab -e
 ```
 
 ```cron
+* * * * *     $HOME/pixelfed-sync/run.sh watch
 * * * * *     $HOME/pixelfed-sync/run.sh
 */30 * * * *  $HOME/pixelfed-sync/run.sh trending
 17 * * * *    $HOME/pixelfed-sync/run.sh index
 ```
 
-(`index` only crawls once per `PF_SYNC_INDEX_INTERVAL_HOURS`; the hourly entry
-just retries if a run was missed.)
+`watch` keeps running; the per-minute entry only (re)starts it if it isn't
+running, e.g. after a container restart. `index` only crawls once per
+`PF_SYNC_INDEX_INTERVAL_HOURS`; the hourly entry just retries a missed run.
 
 ## Configuration
 
@@ -123,7 +130,8 @@ change. Every feature can be switched off and its limits adjusted. Main settings
 | `PF_SYNC_WEB_CONTAINER` | auto | the one running compose service `web`/`pixelfed` with a `pixelfed` image |
 | `PF_SYNC_BACKFILL_LIMIT` | `20` | posts fetched when a profile is opened or followed |
 | `PF_SYNC_SCROLL_BACKFILL` / `_BATCH` / `_MAX_POSTS` | `true` / `20` / `240` | older posts on scroll |
-| `PF_SYNC_POST_DETAILS` / `_REPLIES_MAX` | `true` / `40` | comments + counts when a post is opened |
+| `PF_SYNC_POST_DETAILS` / `_REPLIES_MAX` / `_COOLDOWN_MINUTES` | `true` / `40` / `2` | comments + counts when a post is opened; reopening after the cooldown checks for new comments |
+| `PF_SYNC_PARALLEL` / `PF_SYNC_WATCH_JOBS` | `4` / `4` | parallel fetch workers / events handled at once |
 | `PF_SYNC_TRENDING` / `_SOURCES` / `_MIN_LIKES` | `true` / 7 Pixelfed servers / `10` | global timeline |
 | `PF_SYNC_BACKFILL_IN_GLOBAL` | `false` | also show backfilled posts in the global timeline |
 | `PF_SYNC_LIKERS` / `_MAX` | `true` / `40` | "Liked by" / "Shared by" lists |
@@ -163,11 +171,17 @@ stay; counts drift back to Pixelfed's own values.
 - It calls internal Pixelfed classes, so a future Pixelfed release may need
   small adjustments. Errors show up in `logs/sync.log`.
 - Things appear on the *next* load: Pixelfed's web UI doesn't refresh by
-  itself. Scroll again, reopen the post or repeat the search after ~15 s.
+  itself. Comments arrive in batches of 8 about every 2 s (40 comments took
+  ~11 s in testing), so reload the post after a few seconds.
+- New comments on remote posts aren't pushed to a small server: Pixelfed
+  delivers a comment to the commenter's followers, mentioned accounts and the
+  post's author, but doesn't forward it to the author's followers. Large
+  servers get them because nearly every commenter has a follower there.
+  pf-sync checks again when the post is reopened after the cooldown.
+- Comments by private Pixelfed accounts are listed by the remote server but
+  refused to non-followers, so they're skipped.
 - Backfilled posts get new local IDs, so ID-ordered views (home, global) sort
   them as if just received. Profiles sort by date and aren't affected.
-- Fetching Mastodon comments takes ~2–3 s each, so a long thread can take a
-  minute or two.
 - Pixelfed itself only puts posts from the last 7 days into home feeds.
   pf-sync rebuilds a local follower's home feed after a backfill so older
   posts show up too.
