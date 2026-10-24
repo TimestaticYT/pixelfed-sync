@@ -16,7 +16,7 @@
  *   docker exec -i -u www-data <web-container> php -- tick [open:ID scroll:ID post:ID ...] < pf-sync.php
  *
  * Commands: tick [...] | events [...] | trending [--force] | index [--force] | backfill <id|@user@domain>
- *           | post <id> | likers <id> | search <name> | clean-global | status
+ *           | post <id> | search <name> | clean-global | status
  *
  * Settings are PF_SYNC_* environment variables (see README / pf-sync.env).
  * Only public posts can be fetched: remote servers serve nothing else without
@@ -92,8 +92,6 @@ define('TRENDING_SOURCES', preg_split('/\s+/', trim((string) cfg(
 // Backfilled posts (opened/followed/scrolled accounts) stay out of the global
 // timeline; it is meant for trending and normally federated posts.
 define('BACKFILL_IN_GLOBAL', cfg('BACKFILL_IN_GLOBAL', false));
-define('LIKERS', cfg('LIKERS', true));
-define('LIKERS_MAX', cfg('LIKERS_MAX', 40));
 
 define('INDEX', cfg('INDEX', true));
 define('INDEX_INTERVAL', cfg('INDEX_INTERVAL_HOURS', 24) * 3600);
@@ -1086,101 +1084,6 @@ function open_post(int|string $id): void
     ));
 }
 
-/**
- * Someone opened "Liked by" or "Shared by" on a remote post: import who liked
- * and shared it, stored the way Pixelfed stores likes and shares it receives
- * from other servers (no notifications, counts unchanged). Mastodon publishes
- * both lists; Pixelfed only reveals one liker, so that's all it can show.
- */
-function open_likers(int|string $id): void
-{
-    if (! LIKERS || ! Cache::add(KEY.'likers:'.$id, 1, POST_COOLDOWN)) {
-        return;
-    }
-    $s = Status::whereKey($id)->where('local', false)->first();
-    $author = $s ? remote_profile($s->profile_id) : null;
-    $uri = $s?->uri ?? $s?->object_url;
-    if (! $author || ! $uri || ! preg_match('#/(\d+)/?$#', (string) parse_url($uri, PHP_URL_PATH), $m)) {
-        return;
-    }
-    $host = parse_url($uri, PHP_URL_HOST);
-    $rid = $m[1];
-
-    $likers = http_json("https://{$host}/api/v1/statuses/{$rid}/favourited_by?limit=".min(LIKERS_MAX, 80));
-    $sharers = http_json("https://{$host}/api/v1/statuses/{$rid}/reblogged_by?limit=".min(LIKERS_MAX, 80));
-    if (! is_array($likers) && ($arid = remote_account_id($author))) {
-        // Pixelfed names one liker by its id on that server, which may be an
-        // account from yet another server: resolve id -> handle -> actor.
-        $one = http_json(api_url(['kind' => 'pixelfed', 'host' => $host, 'rid' => $arid, 'max_id' => (string) ((int) $rid + 1)], 1));
-        $by = $one[0]['liked_by'] ?? null;
-        $acct = is_array($by) && isset($by['id']) ? (http_json("https://{$host}/api/pixelfed/v1/accounts/{$by['id']}")['acct'] ?? null) : null;
-        $actor = is_string($acct) ? webfinger_actor(str_contains($acct, '@') ? $acct : "{$acct}@{$host}") : null;
-        $likers = $actor ? [['uri' => $actor]] : null;
-    }
-    if (! is_array($likers) && ! is_array($sharers)) {
-        Cache::forget(KEY.'likers:'.$id);
-
-        return;
-    }
-
-    $lists = [
-        'likes' => array_slice(array_filter(is_array($likers) ? $likers : [], 'is_array'), 0, LIKERS_MAX),
-        'shares' => array_slice(array_filter(is_array($sharers) ? $sharers : [], 'is_array'), 0, LIKERS_MAX),
-    ];
-    $unique = [];
-    foreach ([...$lists['likes'], ...$lists['shares']] as $a) {
-        if (is_string($a['uri'] ?? null)) {
-            $unique[$a['uri']] = $a;
-        }
-    }
-    parallel($unique, fn ($a) => import_account($a, false));
-
-    $tally = ['likes' => 0, 'shares' => 0, 'failed' => 0];
-    foreach ($lists as $kind => $accounts) {
-        foreach ($accounts as $a) {
-            if (! is_string($a['uri'] ?? null)
-                || ! ($p = Profile::where('remote_url', $a['uri'])->whereNotNull('domain')->first())) {
-                $tally['failed']++;
-
-                continue;
-            }
-            $row = $kind === 'likes'
-                ? Like::firstOrCreate(
-                    ['profile_id' => $p->id, 'status_id' => $s->id],
-                    ['status_profile_id' => $s->profile_id, 'is_comment' => (bool) $s->in_reply_to_id]
-                )
-                : Status::firstOrCreate(['profile_id' => $p->id, 'reblog_of_id' => $s->id, 'type' => 'share', 'local' => false]);
-            if ($row->wasRecentlyCreated) {
-                $tally[$kind]++;
-            }
-        }
-    }
-    StatusService::del($s->id);
-
-    out(sprintf(
-        'likers %s: %d likes, %d shares added, %d failed (remote lists: %s likes, %s shares)',
-        $uri, $tally['likes'], $tally['shares'], $tally['failed'],
-        is_array($likers) ? count($likers) : '-', is_array($sharers) ? count($sharers) : '-'
-    ));
-}
-
-/** Actor URI for user@host via webfinger. */
-function webfinger_actor(string $acct): ?string
-{
-    [$user, $host] = array_pad(explode('@', ltrim($acct, '@'), 2), 2, null);
-    if (! $user || ! $host) {
-        return null;
-    }
-    $wf = http_json("https://{$host}/.well-known/webfinger?resource=acct:".rawurlencode($user)."@{$host}");
-    foreach ($wf['links'] ?? [] as $link) {
-        if (($link['rel'] ?? null) === 'self' && is_string($link['href'] ?? null)) {
-            return $link['href'];
-        }
-    }
-
-    return null;
-}
-
 function remote_profile(int|string $id): ?Profile
 {
     $p = Profile::whereKey($id)->whereNotNull('domain')->first();
@@ -1216,7 +1119,7 @@ function track(array $ids): void
 }
 
 /**
- * Handles what someone just did (search, opened post/likers, scrolled or
+ * Handles what someone just did (search, opened post, scrolled or
  * opened profile). The live watcher calls this per event ("events" command);
  * cron's "tick" also does the periodic work.
  *
@@ -1229,9 +1132,6 @@ function cmd_tick(array $events, bool $periodic): void
     }
     foreach (array_unique($events['post']) as $id) {
         open_post($id);
-    }
-    foreach (array_unique($events['likers']) as $id) {
-        open_likers($id);
     }
     $scrolled = array_filter(array_map('remote_profile', array_unique($events['scroll'])));
     track(array_map(fn ($p) => $p->id, $scrolled));
@@ -1404,12 +1304,6 @@ function cmd_search(string $q): void
     lookup_search($q);
 }
 
-function cmd_likers(string $id): void
-{
-    Cache::forget(KEY.'likers:'.$id);
-    open_likers($id);
-}
-
 function cmd_post(string $id): void
 {
     Cache::forget(KEY.'post:'.$id);
@@ -1421,10 +1315,10 @@ function cmd_status(): void
     $tracked = Cache::get(KEY.'tracked', []);
     $followed = array_flip(followed_remote_ids());
     printf(
-        "settings: backfill %d, resync %dh, scroll %s (batch %d, max %d), post details %s (max %d comments), likers %s\n"
+        "settings: backfill %d, resync %dh, scroll %s (batch %d, max %d), post details %s (max %d comments)\n"
         ."          trending %s every %d min (%d sources, >= %d likes), backfill in global %s\n",
         BACKFILL_LIMIT, RESYNC_SECONDS / 3600, SCROLL_BACKFILL ? 'on' : 'off', SCROLL_BATCH, SCROLL_MAX_POSTS,
-        POST_DETAILS ? 'on' : 'off', POST_REPLIES_MAX, LIKERS ? 'on' : 'off',
+        POST_DETAILS ? 'on' : 'off', POST_REPLIES_MAX,
         TRENDING ? 'on' : 'off', TRENDING_INTERVAL / 60, count(TRENDING_SOURCES), TRENDING_MIN_LIKES, BACKFILL_IN_GLOBAL ? 'on' : 'off'
     );
     printf(
@@ -1457,10 +1351,10 @@ function cmd_status(): void
     echo 'last trending run: '.($t ? gmdate('Y-m-d H:i', (int) $t).'Z' : '-').PHP_EOL;
 }
 
-/** tick arguments: open:ID, scroll:ID, post:ID, likers:ID, search:<url-encoded query> (a bare ID means open). */
+/** tick arguments: open:ID, scroll:ID, post:ID, search:<url-encoded query> (a bare ID means open). */
 function parse_events(array $args): array
 {
-    $events = ['open' => [], 'scroll' => [], 'post' => [], 'likers' => [], 'search' => []];
+    $events = ['open' => [], 'scroll' => [], 'post' => [], 'search' => []];
     foreach ($args as $arg) {
         [$kind, $val] = str_contains($arg, ':') ? explode(':', $arg, 2) : ['open', $arg];
         if ($kind === 'search') {
@@ -1498,7 +1392,6 @@ match ($cmd) {
     'search' => isset($args[0]) ? cmd_search(implode(' ', $args)) : out('usage: search <name>'),
     'backfill' => isset($args[0]) ? cmd_backfill($args[0]) : out('usage: backfill <id|@user@domain>'),
     'post' => isset($args[0]) ? cmd_post($args[0]) : out('usage: post <local status id>'),
-    'likers' => isset($args[0]) ? cmd_likers($args[0]) : out('usage: likers <local status id>'),
     'clean-global' => cmd_clean_global(),
     'status' => cmd_status(),
     default => out("unknown command {$cmd}"),
