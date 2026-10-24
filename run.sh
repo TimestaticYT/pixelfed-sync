@@ -10,6 +10,7 @@
 #   open a profile     GET /api/(pixelfed/)v1/accounts/<id>
 #   scroll a profile   GET /api/(pixelfed/)v1/accounts/<id>/statuses?...cursor=|max_id=
 #   open a post        GET /api/(pixelfed/)v1/statuses/<id>[/context]
+#   liked/shared by    GET /api/v1/statuses/<id>/favourited_by|reblogged_by
 #   search             GET /api/v2/search?q=...
 set -euo pipefail
 
@@ -77,6 +78,8 @@ for i in 1 2 3 4; do
                 | sed -E 's#^.*/accounts/([0-9]+)/.*#scroll:\1#' || true
             grep -E '^/api/(pixelfed/)?v1/statuses/[0-9]+(/context)?$' <<<"$requests" \
                 | sed -E 's#^.*/statuses/([0-9]+).*#post:\1#' || true
+            grep -E '^/api/v1/statuses/[0-9]+/(favourited_by|reblogged_by)' <<<"$requests" \
+                | sed -E 's#^.*/statuses/([0-9]+)/.*#likers:\1#' || true
             grep -E '^/api/v2/search\?' <<<"$requests" | grep -oE '[?&]q=[^&]+' | sed -E 's#^.q=#search:#' || true
         } | sort -u
     )

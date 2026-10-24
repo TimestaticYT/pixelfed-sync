@@ -17,8 +17,9 @@ pf-sync fills those gaps without patching Pixelfed:
 | scroll to the end of it | loads the next 20 older posts, continuing on the remote server where the last batch ended |
 | follow someone | does the same backfill and adds the posts to your home feed; re-syncs followed accounts every 6 h |
 | open a remote post | fetches its comments (commenters' avatars follow automatically) and the real like/repost/comment counts |
+| open "Liked by" / "Shared by" | imports who liked and shared it (Mastodon publishes both lists; Pixelfed only reveals one liker) |
 | search for a name, e.g. `xkcd` | looks it up on mastodon.social and imports the most followed accounts whose handle starts with it; search again a few seconds later and they're listed, most followed first |
-| open the global timeline | finds trending posts from pixelfed.social and mastodon.social, pulled in every 30 min (sensitive ones skipped) |
+| open the global timeline | finds trending posts from 7 Pixelfed servers with at least 10 likes, pulled in every 30 min (sensitive ones skipped). Backfilled posts stay out of it |
 | open Discover → Popular accounts | finds popular accounts from a daily crawl of public account directories |
 
 Only **public** content can be fetched: remote servers don't serve
@@ -45,6 +46,7 @@ trigger fetches.
 | profile opened | `GET /api/(pixelfed/)v1/accounts/<id>` |
 | profile scrolled | `GET /api/(pixelfed/)v1/accounts/<id>/statuses?…cursor=…` (or `max_id=`) |
 | post opened | `GET /api/(pixelfed/)v1/statuses/<id>[/context]` |
+| likes/shares list opened | `GET /api/v1/statuses/<id>/favourited_by` or `/reblogged_by` |
 | search | `GET /api/v2/search?q=…` |
 
 Where remote data comes from:
@@ -54,6 +56,10 @@ Where remote data comes from:
   (`only_media`, no replies, no boosts), then the ActivityPub outbox.
 - **Comments:** Mastodon's `/api/v1/statuses/{id}/context`, or Pixelfed's public
   `/api/v2/comments/{account}/status/{id}`.
+- **Likers/sharers:** Mastodon's `/api/v1/statuses/{id}/favourited_by` and `/reblogged_by`.
+  They are stored exactly as Pixelfed stores likes and shares it receives from
+  other servers, without notifications or count changes.
+- **Trending:** Pixelfed's public `/api/pixelfed/v2/discover/posts/trending`.
 - **Counts:** the remote APIs, or the actor's ActivityPub collections for profiles.
 
 ### How remote and local numbers combine
@@ -118,7 +124,9 @@ change. Every feature can be switched off and its limits adjusted. Main settings
 | `PF_SYNC_BACKFILL_LIMIT` | `20` | posts fetched when a profile is opened or followed |
 | `PF_SYNC_SCROLL_BACKFILL` / `_BATCH` / `_MAX_POSTS` | `true` / `20` / `240` | older posts on scroll |
 | `PF_SYNC_POST_DETAILS` / `_REPLIES_MAX` | `true` / `40` | comments + counts when a post is opened |
-| `PF_SYNC_TRENDING` / `_SOURCES` | `true` / pixelfed.social, mastodon.social | global timeline |
+| `PF_SYNC_TRENDING` / `_SOURCES` / `_MIN_LIKES` | `true` / 7 Pixelfed servers / `10` | global timeline |
+| `PF_SYNC_BACKFILL_IN_GLOBAL` | `false` | also show backfilled posts in the global timeline |
+| `PF_SYNC_LIKERS` / `_MAX` | `true` / `40` | "Liked by" / "Shared by" lists |
 | `PF_SYNC_INDEX` / `_MIN_FOLLOWERS` / `_SOURCES` | `true` / `1000` / 5 large servers | account index |
 | `PF_SYNC_SEARCH_LOOKUP` / `_SERVERS` | `true` / mastodon.social | search lookup |
 
@@ -139,6 +147,8 @@ run backfill @user@example.social # backfill now (search the account in Pixelfed
 run post <local post id>          # fetch comments and counts for a post now
 run search xkcd                   # search lookup now
 run trending --force              # trending run now
+run likers <local post id>        # import who liked/shared a post now
+run clean-global                  # one-off: drop non-trending posts from the global timeline
 run index --force                 # directory crawl now
 tail -f logs/sync.log
 ```

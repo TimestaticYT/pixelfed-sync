@@ -43,6 +43,7 @@ use App\Models\Status;
 use App\Services\AccountService;
 use App\Services\ActivityPubFetchService;
 use App\Services\HomeTimelineService;
+use App\Services\NetworkTimelineService;
 use App\Services\StatusService;
 use App\Util\ActivityPub\Helpers;
 use Illuminate\Support\Facades\Cache;
@@ -75,11 +76,21 @@ define('TRENDING', cfg('TRENDING', true));
 define('TRENDING_INTERVAL', cfg('TRENDING_INTERVAL_MINUTES', 30) * 60);
 define('TRENDING_MAX_PER_RUN', cfg('TRENDING_MAX_PER_RUN', 80));
 define('TRENDING_SKIP_SENSITIVE', cfg('TRENDING_SKIP_SENSITIVE', true));
+define('TRENDING_MIN_LIKES', cfg('TRENDING_MIN_LIKES', 10));
+// Pixelfed servers' public trending lists. Mastodon's is photo-light, so it's
+// opt-in: add https://mastodon.social/api/v1/trends/statuses?limit=40
 define('TRENDING_SOURCES', preg_split('/\s+/', trim((string) cfg(
     'TRENDING_SOURCES',
-    'https://pixelfed.social/api/pixelfed/v2/discover/posts/trending?range=daily '
-    .'https://mastodon.social/api/v1/trends/statuses?limit=40'
+    implode(' ', array_map(
+        fn ($h) => "https://{$h}/api/pixelfed/v2/discover/posts/trending?range=daily",
+        ['pixelfed.social', 'pixelfed.de', 'pixelfed.art', 'pixelfed.fr', 'pixelfed.au', 'pixelfed.uno', 'metapixl.com']
+    ))
 )), -1, PREG_SPLIT_NO_EMPTY));
+// Backfilled posts (opened/followed/scrolled accounts) stay out of the global
+// timeline; it is meant for trending and normally federated posts.
+define('BACKFILL_IN_GLOBAL', cfg('BACKFILL_IN_GLOBAL', false));
+define('LIKERS', cfg('LIKERS', true));
+define('LIKERS_MAX', cfg('LIKERS_MAX', 40));
 
 define('INDEX', cfg('INDEX', true));
 define('INDEX_INTERVAL', cfg('INDEX_INTERVAL_HOURS', 24) * 3600);
@@ -404,9 +415,11 @@ function write_post_counts(Status $s, array $counts): bool
 
 /**
  * Fetches items through Pixelfed, oldest first so feed order stays right,
- * then applies their counts (to already stored posts too). Returns [new, failed].
+ * then applies their counts (to already stored posts too). Pixelfed adds new
+ * public posts to the global timeline; with $global false they're taken out
+ * again. Returns [new, failed].
  */
-function fetch_items(array $items): array
+function fetch_items(array $items, bool $global): array
 {
     $new = $failed = 0;
     foreach (array_reverse($items) as $item) {
@@ -414,9 +427,18 @@ function fetch_items(array $items): array
             continue;
         }
         try {
-            Helpers::statusFetch($item['uri']) ? $new++ : $failed++;
+            $status = Helpers::statusFetch($item['uri']);
         } catch (Throwable) {
+            $status = null;
+        }
+        if (! $status) {
             $failed++;
+
+            continue;
+        }
+        $new++;
+        if (! $global) {
+            NetworkTimelineService::rem($status->id);
         }
     }
     foreach ($items as $item) {
@@ -634,7 +656,7 @@ function save_cursor(Profile $p, ?array $next): void
 function backfill(Profile $p, string $why): void
 {
     [$items, $next] = remote_page($p, null, BACKFILL_LIMIT);
-    [$new, $failed] = fetch_items($items);
+    [$new, $failed] = fetch_items($items, BACKFILL_IN_GLOBAL);
     // Keep an older scroll position: re-syncs only need the newest page.
     if ($why !== 'followed' || ! Cache::has(KEY.'cursor:'.$p->id)) {
         save_cursor($p, $next);
@@ -673,7 +695,7 @@ function scroll(Profile $p): void
     $new = $failed = $pages = 0;
     do {
         [$items, $next] = remote_page($p, $cursor, $limit);
-        [$n, $f] = fetch_items($items);
+        [$n, $f] = fetch_items($items, BACKFILL_IN_GLOBAL);
         $new += $n;
         $failed += $f;
         $retry = $cursor !== null && $next === $cursor;
@@ -746,7 +768,7 @@ function open_post(int|string $id): void
     // fetch_items works back to front; reversing first keeps Mastodon's
     // parent-before-child thread order.
     $replies = array_slice($replies, 0, POST_REPLIES_MAX);
-    [$new, $failed] = fetch_items(array_reverse($replies));
+    [$new, $failed] = fetch_items(array_reverse($replies), false);
     // Pixelfed's queue bumps reply_count for every fetched reply, partly after
     // this returns, so the base is also re-applied by the next ticks.
     set_post_remote_counts($s->fresh(), $counts);
@@ -754,9 +776,76 @@ function open_post(int|string $id): void
         $pending = Cache::get(KEY.'pending-counts', []);
         $pending[(string) $s->id] = time() + PENDING_COUNTS_SECONDS;
         Cache::forever(KEY.'pending-counts', $pending);
+    } else {
+        // Remote unreachable or rate limited: let the next open retry.
+        Cache::forget(KEY.'post:'.$id);
     }
 
     out(sprintf('post %s: %d comments listed, %d new, %d failed; counts %s', $uri, count($replies), $new, $failed, json_encode($counts)));
+}
+
+/**
+ * Someone opened "Liked by" or "Shared by" on a remote post: import who liked
+ * and shared it, stored the way Pixelfed stores likes and shares it receives
+ * from other servers (no notifications, counts unchanged). Mastodon publishes
+ * both lists; Pixelfed only reveals one liker, so that's all it can show.
+ */
+function open_likers(int|string $id): void
+{
+    if (! LIKERS || ! Cache::add(KEY.'likers:'.$id, 1, POST_COOLDOWN)) {
+        return;
+    }
+    $s = Status::whereKey($id)->where('local', false)->first();
+    $author = $s ? remote_profile($s->profile_id) : null;
+    $uri = $s?->uri ?? $s?->object_url;
+    if (! $author || ! $uri || ! preg_match('#/(\d+)/?$#', (string) parse_url($uri, PHP_URL_PATH), $m)) {
+        return;
+    }
+    $host = parse_url($uri, PHP_URL_HOST);
+    $rid = $m[1];
+
+    $likers = http_json("https://{$host}/api/v1/statuses/{$rid}/favourited_by?limit=".min(LIKERS_MAX, 80));
+    $sharers = http_json("https://{$host}/api/v1/statuses/{$rid}/reblogged_by?limit=".min(LIKERS_MAX, 80));
+    if (! is_array($likers) && ($arid = remote_account_id($author))) {
+        $one = http_json(api_url(['kind' => 'pixelfed', 'host' => $host, 'rid' => $arid, 'max_id' => (string) ((int) $rid + 1)], 1));
+        $by = $one[0]['liked_by'] ?? null;
+        $likers = is_array($by) && is_string($by['username'] ?? null)
+            ? [['uri' => "https://{$host}/users/{$by['username']}"]]
+            : null;
+    }
+    if (! is_array($likers) && ! is_array($sharers)) {
+        Cache::forget(KEY.'likers:'.$id);
+
+        return;
+    }
+
+    $tally = ['likes' => 0, 'shares' => 0, 'failed' => 0];
+    foreach ([['likes', $likers], ['shares', $sharers]] as [$kind, $accounts]) {
+        foreach (array_slice(is_array($accounts) ? $accounts : [], 0, LIKERS_MAX) as $a) {
+            if (! is_array($a) || import_account($a, false) === 'skipped'
+                || ! ($p = Profile::where('remote_url', $a['uri'])->whereNotNull('domain')->first())) {
+                $tally['failed']++;
+
+                continue;
+            }
+            $row = $kind === 'likes'
+                ? Like::firstOrCreate(
+                    ['profile_id' => $p->id, 'status_id' => $s->id],
+                    ['status_profile_id' => $s->profile_id, 'is_comment' => (bool) $s->in_reply_to_id]
+                )
+                : Status::firstOrCreate(['profile_id' => $p->id, 'reblog_of_id' => $s->id, 'type' => 'share', 'local' => false]);
+            if ($row->wasRecentlyCreated) {
+                $tally[$kind]++;
+            }
+        }
+    }
+    StatusService::del($s->id);
+
+    out(sprintf(
+        'likers %s: %d likes, %d shares added, %d failed (remote lists: %s likes, %s shares)',
+        $uri, $tally['likes'], $tally['shares'], $tally['failed'],
+        is_array($likers) ? count($likers) : '-', is_array($sharers) ? count($sharers) : '-'
+    ));
 }
 
 function remote_profile(int|string $id): ?Profile
@@ -790,6 +879,9 @@ function cmd_tick(array $events): void
     }
     foreach (array_unique($events['post']) as $id) {
         open_post($id);
+    }
+    foreach (array_unique($events['likers']) as $id) {
+        open_likers($id);
     }
     foreach (array_filter(array_map('remote_profile', array_unique($events['scroll']))) as $p) {
         $tracked[(string) $p->id] = $now;
@@ -865,15 +957,61 @@ function cmd_trending(bool $force): void
 
             continue;
         }
-        $items = array_values(array_filter(array_map(fn ($s) => is_array($s) ? wanted_api_status($s, TRENDING_SKIP_SENSITIVE) : null, $list)));
+        $items = array_values(array_filter(
+            array_map(fn ($s) => is_array($s) ? wanted_api_status($s, TRENDING_SKIP_SENSITIVE) : null, $list),
+            fn ($i) => $i && ($i['counts']['likes_count'] ?? 0) >= TRENDING_MIN_LIKES
+        ));
         $fresh = array_values(array_filter($items, fn ($i) => ! stored_status($i['uri'])));
         $known = array_filter($items, fn ($i) => ! in_array($i, $fresh, true));
         // Known posts only get their counts refreshed.
-        [$new, $failed] = fetch_items([...array_slice($fresh, 0, max(0, $budget)), ...$known]);
+        [$new, $failed] = fetch_items([...array_slice($fresh, 0, max(0, $budget)), ...$known], true);
         $budget -= $new + $failed;
-        $summary[] = sprintf('%s: %d candidates, %d new, %d failed', $name, count($list), $new, $failed);
+        mark_trending($items);
+        $summary[] = sprintf('%s: %d listed, %d popular enough, %d new, %d failed', $name, count($list), count($items), $new, $failed);
     }
     out('trending '.implode('; ', $summary));
+}
+
+/**
+ * Remembers trending picks and puts them in the global timeline if Pixelfed
+ * considers them eligible (e.g. a post first stored by a backfill).
+ */
+function mark_trending(array $items): void
+{
+    $picked = Cache::get(KEY.'trending-ids', []);
+    foreach ($items as $item) {
+        if (! ($s = stored_status($item['uri']))) {
+            continue;
+        }
+        $picked[(string) $s->id] = time();
+        if (Helpers::isEligibleForNetwork($s)) {
+            NetworkTimelineService::add($s->id);
+        }
+    }
+    Cache::forever(KEY.'trending-ids', array_filter($picked, fn ($ts) => $ts > time() - TRACK_DAYS * 86400));
+}
+
+/**
+ * One-off cleanup: takes everything out of the global timeline that isn't a
+ * trending pick or a post this server's users interacted with. Normally
+ * federated posts arriving later are left alone.
+ */
+function cmd_clean_global(): void
+{
+    $picked = Cache::get(KEY.'trending-ids', []);
+    $removed = $kept = 0;
+    foreach (NetworkTimelineService::get(0, 2000) as $id) {
+        $s = Status::find($id);
+        $interacted = $s && array_sum(local_post_counts($id)) > 0;
+        if ($s && (isset($picked[(string) $id]) || $s->local || $interacted)) {
+            $kept++;
+
+            continue;
+        }
+        NetworkTimelineService::rem($id);
+        $removed++;
+    }
+    out("clean-global: kept {$kept}, removed {$removed}");
 }
 
 function cmd_backfill(string $who): void
@@ -899,6 +1037,12 @@ function cmd_search(string $q): void
     lookup_search($q);
 }
 
+function cmd_likers(string $id): void
+{
+    Cache::forget(KEY.'likers:'.$id);
+    open_likers($id);
+}
+
 function cmd_post(string $id): void
 {
     Cache::forget(KEY.'post:'.$id);
@@ -910,9 +1054,11 @@ function cmd_status(): void
     $tracked = Cache::get(KEY.'tracked', []);
     $followed = array_flip(followed_remote_ids());
     printf(
-        "settings: backfill %d, resync %dh, scroll %s (batch %d, max %d), post details %s (max %d comments), trending %s every %d min\n",
+        "settings: backfill %d, resync %dh, scroll %s (batch %d, max %d), post details %s (max %d comments), likers %s\n"
+        ."          trending %s every %d min (%d sources, >= %d likes), backfill in global %s\n",
         BACKFILL_LIMIT, RESYNC_SECONDS / 3600, SCROLL_BACKFILL ? 'on' : 'off', SCROLL_BATCH, SCROLL_MAX_POSTS,
-        POST_DETAILS ? 'on' : 'off', POST_REPLIES_MAX, TRENDING ? 'on' : 'off', TRENDING_INTERVAL / 60
+        POST_DETAILS ? 'on' : 'off', POST_REPLIES_MAX, LIKERS ? 'on' : 'off',
+        TRENDING ? 'on' : 'off', TRENDING_INTERVAL / 60, count(TRENDING_SOURCES), TRENDING_MIN_LIKES, BACKFILL_IN_GLOBAL ? 'on' : 'off'
     );
     printf(
         "          index %s (>= %d followers, %d sources), search lookup %s via %s\n",
@@ -944,10 +1090,10 @@ function cmd_status(): void
     echo 'last trending run: '.($t ? gmdate('Y-m-d H:i', (int) $t).'Z' : '-').PHP_EOL;
 }
 
-/** tick arguments: open:ID, scroll:ID, post:ID, search:<url-encoded query> (a bare ID means open). */
+/** tick arguments: open:ID, scroll:ID, post:ID, likers:ID, search:<url-encoded query> (a bare ID means open). */
 function parse_events(array $args): array
 {
-    $events = ['open' => [], 'scroll' => [], 'post' => [], 'search' => []];
+    $events = ['open' => [], 'scroll' => [], 'post' => [], 'likers' => [], 'search' => []];
     foreach ($args as $arg) {
         [$kind, $val] = str_contains($arg, ':') ? explode(':', $arg, 2) : ['open', $arg];
         if ($kind === 'search') {
@@ -984,6 +1130,8 @@ match ($cmd) {
     'search' => isset($args[0]) ? cmd_search(implode(' ', $args)) : out('usage: search <name>'),
     'backfill' => isset($args[0]) ? cmd_backfill($args[0]) : out('usage: backfill <id|@user@domain>'),
     'post' => isset($args[0]) ? cmd_post($args[0]) : out('usage: post <local status id>'),
+    'likers' => isset($args[0]) ? cmd_likers($args[0]) : out('usage: likers <local status id>'),
+    'clean-global' => cmd_clean_global(),
     'status' => cmd_status(),
     default => out("unknown command {$cmd}"),
 };
