@@ -1,5 +1,11 @@
 # pixelfed-sync
 
+> **No longer maintained.** This repository is archived as of November 2026; I no
+> longer run a Pixelfed server. It was last used with Pixelfed v0.15.2
+> ([jippi/docker-pixelfed](https://github.com/jippi/docker-pixelfed) `v0.15.2-docker0`).
+> It relies on Pixelfed internals, so newer versions may need changes. Feel free
+> to fork it.
+
 Makes a small or single-user [Pixelfed](https://pixelfed.org) server feel populated.
 
 Out of the box, a new Pixelfed server:
